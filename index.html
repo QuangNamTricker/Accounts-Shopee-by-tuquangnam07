@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Accounts Shopee by tuquangnam07</title>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import {
+    getFirestore, collection, addDoc, getDocs, doc, deleteDoc,
+    updateDoc, onSnapshot, query, orderBy, serverTimestamp,
+    increment
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  // ===== FIREBASE CONFIG =====
+  const firebaseConfig = {
+    apiKey: "AIzaSyBArweay4vxW3WzEaR9BpbSRVFM_YikIGk",
+    authDomain: "account-shopee-tqn.firebaseapp.com",
+    projectId: "account-shopee-tqn",
+    storageBucket: "account-shopee-tqn.firebasestorage.app",
+    messagingSenderId: "985422043627",
+    appId: "1:985422043627:web:09fe94be2b09696f3b61ae",
+    measurementId: "G-G7X8LXKFN0"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+
+  // ===== STATE =====
+  let accounts = [];
+  let currentAccountId = null;
+  let currentTab = 'info';
+  let searchTerm = '';
+  let filterStatus = 'all';
+  let viewMode = 'table'; // 'table' | 'card'
+
+  const $ = (sel) => document.querySelector(sel);
+  const $$ = (sel) => document.querySelectorAll(sel);
+
+  // ===== TOAST =====
+  window.showToast = (msg, type = 'success') => {
+    const colors = { success: 'bg-green-500', error: 'bg-red-500', info: 'bg-blue-500' };
+    const toast = document.createElement('div');
+    toast.className = `fixed top-5 right-5 ${colors[type]} text-white px-5 py-3 rounded-lg shadow-lg z-[9999] transition-all duration-300 translate-x-full`;
+    toast.textContent = msg;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.classList.remove('translate-x-full'), 50);
+    setTimeout(() => {
+      toast.classList.add('translate-x-full');
+      setTimeout(() => toast.remove(), 300);
+    }, 2500);
+  };
+
+  // ===== HELPERS =====
+  const escapeHtml = (str) => String(str ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+
+  const formatDate = (d) => {
+    if (!d) return '—';
+    try {
+      // Nếu là Timestamp Firestore
+      if (d.toDate) d = d.toDate();
+      // Nếu là string dd/mm/yyyy hoặc yyyy-mm-dd
+      if (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)) {
+        const [y, m, day] = d.split('-');
+        return `${day}/${m}/${y}`;
+      }
+      if (typeof d === 'string' && /^\d{2}\/\d{2}\/\d{4}$/.test(d)) return d;
+      const date = new Date(d);
+      if (isNaN(date)) return d;
+      const day = String(date.getDate()).padStart(2, '0');
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      return `${day}/${month}/${date.getFullYear()}`;
+    } catch { return d; }
+  };
+
+  const todayInput = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  };
+
+  // ===== STATUS BADGE =====
+  const statusBadge = (status) => {
+    const map = {
+      active:  { text: 'Đang dùng',  cls: 'bg-green-100 text-green-700 border-green-300',   dot: 'bg-green-500' },
+      pending: { text: 'Chưa mua',   cls: 'bg-yellow-100 text-yellow-700 border-yellow-300', dot: 'bg-yellow-500' },
+      bought:  { text: 'Đã mua',     cls: 'bg-blue-100 text-blue-700 border-blue-300',      dot: 'bg-blue-500' },
+      sold:    { text: 'Đã bán',     cls: 'bg-red-100 text-red-700 border-red-300',         dot: 'bg-red-500' },
+      locked:  { text: 'Bị khóa',    cls: 'bg-gray-100 text-gray-700 border-gray-300',      dot: 'bg-gray-500' },
+    };
+    const s = map[status] || map.pending;
+    return `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full border ${s.cls} whitespace-nowrap">
+      <span class="w-1.5 h-1.5 rounded-full ${s.dot}"></span>${s.text}
+    </span>`;
+  };
+
+  const orderStatusText = (status) => {
+    const map = {
+      pending:  { text: 'Chờ xử lý',  cls: 'bg-yellow-100 text-yellow-700' },
+      shipping: { text: 'Đang giao',  cls: 'bg-blue-100 text-blue-700' },
+      done:     { text: 'Hoàn thành', cls: 'bg-green-100 text-green-700' },
+      cancel:   { text: 'Đã hủy',     cls: 'bg-red-100 text-red-700' },
+    };
+    const s = map[status] || map.pending;
+    return `<span class="px-2 py-0.5 text-xs rounded-full ${s.cls}">${s.text}</span>`;
+  };
+
+  // ===== ADD ACCOUNT MODAL =====
+  window.openAddModal = () => {
+    $('#addModal').classList.remove('hidden');
+    $('#addModal').classList.add('flex');
+    $('#createdAtInput').value = todayInput();
+  };
+  window.closeAddModal = () => {
+    $('#addModal').classList.add('hidden');
+    $('#addModal').classList.remove('flex');
+    $('#addForm').reset();
+  };
+
+  window.handleAddAccount = async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button[type=submit]');
+    btn.disabled = true;
+    btn.innerHTML = '⏳ Đang lưu...';
+
+    try {
+      const form = e.target;
+      const data = {
+        username: form.username.value.trim(),
+        password: form.password.value.trim(),
+        phone: form.phone.value.trim(),
+        email: form.email.value.trim(),
+        deviceCreated: form.deviceCreated.value.trim(),
+        deviceBought: form.deviceBought.value.trim(),
+        accountCreatedAt: form.accountCreatedAt.value || '',
+        accountBoughtAt: form.accountBoughtAt.value || '',
+        status: form.status.value,
+        note: form.note.value.trim(),
+        orderCount: 0,
+        createdAtServer: serverTimestamp()
+      };
+
+      await addDoc(collection(db, 'accounts'), data);
+      window.showToast('✅ Đã thêm tài khoản!');
+      closeAddModal();
+    } catch (err) {
+      console.error(err);
+      window.showToast('❌ Lỗi: ' + err.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '💾 Lưu tài khoản';
+    }
+  };
+
+  // ===== LOAD ACCOUNTS =====
+  const loadAccounts = () => {
+    const q = query(collection(db, 'accounts'), orderBy('createdAtServer', 'desc'));
+    onSnapshot(q, (snapshot) => {
+      accounts = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      renderAccounts();
+      renderStats();
+    }, (err) => {
+      console.error('Load error:', err);
+      getDocs(collection(db, 'accounts')).then(snap => {
+        accounts = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        renderAccounts();
+        renderStats();
+      });
+    });
+  };
+
+  // ===== STATS =====
+  const renderStats = () => {
+    const total = accounts.length;
+    const totalOrders = accounts.reduce((s, a) => s + (a.orderCount || 0), 0);
+    const active = accounts.filter(a => a.status === 'active' || a.status === 'bought').length;
+    const sold = accounts.filter(a => a.status === 'sold').length;
+    $('#statTotal').textContent = total;
+    $('#statOrders').textContent = totalOrders;
+    $('#statActive').textContent = active;
+    $('#statSold').textContent = sold;
+  };
+
+  // ===== RENDER ACCOUNTS (TABLE VIEW - giống Excel) =====
+  const renderAccounts = () => {
+    let list = accounts;
+
+    if (searchTerm) {
+      const t = searchTerm.toLowerCase();
+      list = list.filter(a =>
+        (a.username || '').toLowerCase().includes(t) ||
+        (a.phone || '').toLowerCase().includes(t) ||
+        (a.email || '').toLowerCase().includes(t)
+      );
+    }
+    if (filterStatus !== 'all') {
+      list = list.filter(a => a.status === filterStatus);
+    }
+
+    const container = $('#accountContainer');
+
+    if (list.length === 0) {
+      container.innerHTML = `
+        <div class="text-center py-20 text-gray-400">
+          <div class="text-6xl mb-3">📭</div>
+          <p class="text-lg">Chưa có tài khoản nào</p>
+          <p class="text-sm mt-1">Nhấn "Thêm Account" để bắt đầu</p>
+        </div>`;
+      return;
+    }
+
+    if (viewMode === 'table') {
+      container.innerHTML = `
+        <div class="bg-white rounded-xl border overflow-hidden shadow-sm">
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead class="bg-gray-50 border-b">
+                <tr class="text-left text-gray-600 text-xs uppercase tracking-wider">
+                  <th class="px-3 py-3 font-semibold">Tài Khoản</th>
+                  <th class="px-3 py-3 font-semibold">Mật Khẩu</th>
+                  <th class="px-3 py-3 font-semibold">SĐT</th>
+                  <th class="px-3 py-3 font-semibold">Email</th>
+                  <th class="px-3 py-3 font-semibold">TB Tạo</th>
+                  <th class="px-3 py-3 font-semibold">TB Mua</th>
+                  <th class="px-3 py-3 font-semibold">Ngày Tạo</th>
+                  <th class="px-3 py-3 font-semibold">Ngày Mua</th>
+                  <th class="px-3 py-3 font-semibold">Trạng Thái</th>
+                  <th class="px-3 py-3 font-semibold text-center">Đơn</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-gray-100">
+                ${list.map(a => `
+                  <tr onclick="openDetail('${a.id}')"
+                    class="hover:bg-orange-50/50 cursor-pointer transition">
+                    <td class="px-3 py-3 font-medium text-gray-800">
+                      <div class="flex items-center gap-2">
+                        <div class="w-7 h-7 rounded-full bg-gradient-to-br from-orange-400 to-orange-600 text-white flex items-center justify-center font-bold text-xs flex-shrink-0">
+                          ${(a.username || '?')[0].toUpperCase()}
+                        </div>
+                        <span>${escapeHtml(a.username || 'N/A')}</span>
+                      </div>
+                    </td>
+                    <td class="px-3 py-3 text-gray-600 font-mono text-xs">
+                      <span class="pwd-mask" data-pwd="${escapeHtml(a.password || '')}">••••••</span>
+                    </td>
+                    <td class="px-3 py-3 text-gray-600 whitespace-nowrap">${escapeHtml(a.phone || '—')}</td>
+                    <td class="px-3 py-3 text-gray-600 max-w-[180px] truncate">${escapeHtml(a.email || '—')}</td>
+                    <td class="px-3 py-3 text-gray-600">${escapeHtml(a.deviceCreated || '—')}</td>
+                    <td class="px-3 py-3 text-gray-600">${escapeHtml(a.deviceBought || '—')}</td>
+                    <td class="px-3 py-3 text-gray-600 whitespace-nowrap">${formatDate(a.accountCreatedAt)}</td>
+                    <td class="px-3 py-3 text-gray-600 whitespace-nowrap">${formatDate(a.accountBoughtAt)}</td>
+                    <td class="px-3 py-3">${statusBadge(a.status)}</td>
+                    <td class="px-3 py-3 text-center">
+                      <span class="inline-flex items-center justify-center min-w-[28px] h-7 px-2 bg-orange-100 text-orange-700 rounded-full font-semibold text-xs">
+                        ${a.orderCount || 0}
+                      </span>
+                    </td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    } else {
+      container.innerHTML = `
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          ${list.map(a => `
+            <div onclick="openDetail('${a.id}')"
+              class="group bg-white rounded-xl border hover:border-orange-400 hover:shadow-lg transition-all cursor-pointer overflow-hidden">
+              <div class="p-5">
+                <div class="flex items-start justify-between mb-3">
+                  <div class="flex items-center gap-3">
+                    <div class="w-11 h-11 rounded-full bg-gradient-to-br from-orange-400 to-orange-600 text-white flex items-center justify-center font-bold text-lg shadow">
+                      ${(a.username || '?')[0].toUpperCase()}
+                    </div>
+                    <div>
+                      <h3 class="font-semibold text-gray-800 group-hover:text-orange-600 transition">
+                        ${escapeHtml(a.username || 'N/A')}
+                      </h3>
+                      <p class="text-xs text-gray-500">${escapeHtml(a.phone || 'Chưa có SĐT')}</p>
+                    </div>
+                  </div>
+                  ${statusBadge(a.status)}
+                </div>
+                <div class="space-y-1.5 text-sm text-gray-600 border-t pt-3">
+                  <div class="flex justify-between">
+                    <span class="text-gray-400">📧 Email:</span>
+                    <span class="truncate max-w-[160px] text-right text-xs">${escapeHtml(a.email || '—')}</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-gray-400">📱 Thiết bị:</span>
+                    <span class="truncate max-w-[160px] text-right text-xs">${escapeHtml(a.deviceCreated || '—')}</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-gray-400">🛒 Đơn hàng:</span>
+                    <span class="font-medium text-orange-600">${a.orderCount || 0}</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-gray-400">📅 Ngày tạo:</span>
+                    <span class="text-xs">${formatDate(a.accountCreatedAt)}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+  };
+
+  // ===== SEARCH & FILTER =====
+  window.handleSearch = (e) => { searchTerm = e.target.value; renderAccounts(); };
+  window.handleFilter = (e) => { filterStatus = e.target.value; renderAccounts(); };
+  window.toggleView = () => {
+    viewMode = viewMode === 'table' ? 'card' : 'table';
+    $('#viewIcon').textContent = viewMode === 'table' ? '⊞' : '☰';
+    $('#viewLabel').textContent = viewMode === 'table' ? 'Dạng thẻ' : 'Dạng bảng';
+    renderAccounts();
+  };
+
+  // ===== OPEN DETAIL =====
+  window.openDetail = (id) => {
+    currentAccountId = id;
+    currentTab = 'info';
+    const acc = accounts.find(a => a.id === id);
+    if (!acc) return;
+    $('#detailModal').classList.remove('hidden');
+    $('#detailModal').classList.add('flex');
+    renderDetail();
+  };
+
+  window.closeDetail = () => {
+    $('#detailModal').classList.add('hidden');
+    $('#detailModal').classList.remove('flex');
+    currentAccountId = null;
+  };
+
+  window.switchTab = (tab) => { currentTab = tab; renderDetail(); };
+
+  // ===== RENDER DETAIL =====
+  const renderDetail = async () => {
+    const acc = accounts.find(a => a.id === currentAccountId);
+    if (!acc) return;
+
+    $('#detailName').textContent = acc.username || 'N/A';
+    $('#detailAvatar').textContent = (acc.username || '?')[0].toUpperCase();
+    $('#detailPhone').textContent = acc.phone || 'Chưa có SĐT';
+
+    $$('.tab-btn').forEach(b => {
+      const isActive = b.dataset.tab === currentTab;
+      b.className = `tab-btn px-5 py-3 font-medium border-b-2 transition whitespace-nowrap ${
+        isActive
+          ? 'border-orange-500 text-orange-600'
+          : 'border-transparent text-gray-500 hover:text-gray-700'
+      }`;
+    });
+
+    const content = $('#detailContent');
+    if (currentTab === 'info') {
+      content.innerHTML = `
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          ${infoField('👤 Tài khoản', acc.username)}
+          ${infoField('🔒 Mật khẩu', acc.password, true)}
+          ${infoField('📞 SĐT', acc.phone)}
+          ${infoField('📧 Email', acc.email)}
+          ${infoField('📱 Thiết bị tạo', acc.deviceCreated)}
+          ${infoField('🛍️ Thiết bị mua', acc.deviceBought)}
+          ${infoField('📅 Ngày tạo acc', formatDate(acc.accountCreatedAt))}
+          ${infoField('💰 Ngày mua acc', formatDate(acc.accountBoughtAt))}
+          <div>
+            <p class="text-xs text-gray-500 mb-1">Trạng thái</p>
+            ${statusBadge(acc.status)}
+          </div>
+          <div>
+            <p class="text-xs text-gray-500 mb-1">Tổng đơn hàng</p>
+            <span class="inline-flex items-center gap-1 px-3 py-1 bg-orange-100 text-orange-700 rounded-full text-sm font-semibold">
+              📦 ${acc.orderCount || 0} đơn
+            </span>
+          </div>
+          ${acc.note ? `<div class="md:col-span-2">
+            <p class="text-xs text-gray-500 mb-1">📝 Ghi chú</p>
+            <p class="text-sm text-gray-700 bg-gray-50 rounded-lg p-3">${escapeHtml(acc.note)}</p>
+          </div>` : ''}
+        </div>
+        <div class="flex justify-end mt-6 pt-4 border-t">
+          <button onclick="deleteAccount('${acc.id}')"
+            class="px-4 py-2 text-sm text-red-600 border border-red-300 rounded-lg hover:bg-red-50 transition">
+            🗑️ Xóa tài khoản
+          </button>
+        </div>
+      `;
+    } else if (currentTab === 'orders') {
+      content.innerHTML = `
+        <div class="flex justify-between items-center mb-4">
+          <div>
+            <p class="text-sm text-gray-500">Lịch sử đơn hàng đã mua bằng acc này</p>
+            <p class="text-xs text-orange-500 mt-0.5">💡 Voucher đã dùng gắn với từng đơn hàng</p>
+          </div>
+          <button onclick="openAddOrder()"
+            class="px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium rounded-lg transition shadow whitespace-nowrap">
+            + Thêm đơn hàng
+          </button>
+        </div>
+        <div id="ordersList" class="space-y-3">
+          <div class="text-center py-10 text-gray-400">⏳ Đang tải đơn hàng...</div>
+        </div>
+      `;
+      await loadOrders(acc.id);
+    }
+  };
+
+  const infoField = (label, value, isPassword = false) => `
+    <div>
+      <p class="text-xs text-gray-500 mb-1">${label}</p>
+      ${isPassword && value
+        ? `<div class="flex items-center gap-2">
+            <span class="text-sm font-medium text-gray-800 font-mono" data-pwd>••••••••</span>
+            <button onclick="togglePwd(this, '${escapeHtml(value).replace(/'/g, "\\'")}')"
+              class="text-xs text-orange-500 hover:underline">Hiện</button>
+          </div>`
+        : `<p class="text-sm font-medium text-gray-800 break-words">${escapeHtml(value || '—')}</p>`}
+    </div>
+  `;
+
+  window.togglePwd = (btn, pwd) => {
+    const span = btn.previousElementSibling;
+    if (span.textContent === '••••••••') {
+      span.textContent = pwd;
+      btn.textContent = 'Ẩn';
+    } else {
+      span.textContent = '••••••••';
+      btn.textContent = 'Hiện';
+    }
+  };
+
+  // ===== ORDERS =====
+  const loadOrders = async (accountId) => {
+    const list = $('#ordersList');
+    if (!list) return;
+    try {
+      const snap = await getDocs(collection(db, 'accounts', accountId, 'orders'));
+      const orders = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      orders.sort((a, b) => (b.orderDate || '').localeCompare(a.orderDate || ''));
+
+      if (orders.length === 0) {
+        list.innerHTML = `
+          <div class="text-center py-12 text-gray-400 bg-gray-50 rounded-xl border-2 border-dashed">
+            <div class="text-5xl mb-2">📦</div>
+            <p>Chưa có đơn hàng nào</p>
+            <p class="text-xs mt-1">Nhấn "+ Thêm đơn hàng" để ghi lại đơn đầu tiên</p>
+          </div>`;
+        return;
+      }
+
+      list.innerHTML = orders.map((o, idx) => `
+        <div class="bg-white border border-gray-200 rounded-xl p-4 hover:border-orange-300 transition">
+          <div class="flex items-start justify-between gap-3 mb-2">
+            <div class="flex items-start gap-3 flex-1">
+              <div class="w-8 h-8 rounded-lg bg-orange-100 text-orange-600 flex items-center justify-center font-bold text-sm flex-shrink-0">
+                ${orders.length - idx}
+              </div>
+              <div class="flex-1 min-w-0">
+                <p class="font-semibold text-gray-800">${escapeHtml(o.productName || 'Không tên SP')}</p>
+                ${o.orderCode ? `<p class="text-xs text-gray-400 mt-0.5">Mã đơn: <span class="font-mono">${escapeHtml(o.orderCode)}</span></p>` : ''}
+              </div>
+            </div>
+            <button onclick="deleteOrder('${accountId}', '${o.id}', ${o._orderCount || 0})"
+              class="text-red-400 hover:text-red-600 text-sm flex-shrink-0">🗑️</button>
+          </div>
+
+          ${o.voucherUsed ? `
+            <div class="mt-3 flex items-center gap-2 bg-gradient-to-r from-orange-50 to-yellow-50 border border-orange-200 rounded-lg p-2.5">
+              <span class="text-lg">🎟️</span>
+              <div class="flex-1">
+                <p class="text-xs text-gray-500">Voucher đã dùng</p>
+                <p class="font-mono text-sm font-bold text-orange-700">${escapeHtml(o.voucherUsed)}</p>
+              </div>
+              <button onclick="copyText('${escapeHtml(o.voucherUsed).replace(/'/g, "\\'")}')"
+                class="px-2 py-1 text-xs bg-white border border-orange-300 text-orange-600 rounded hover:bg-orange-50 transition">
+                📋 Copy
+              </button>
+            </div>
+          ` : ''}
+
+          <div class="flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-gray-500 mt-3 pt-3 border-t">
+            ${o.shopName ? `<span>🏪 ${escapeHtml(o.shopName)}</span>` : ''}
+            ${o.price ? `<span>💰 ${Number(o.price).toLocaleString('vi-VN')}đ</span>` : ''}
+            ${o.orderDate ? `<span>📅 ${formatDate(o.orderDate)}</span>` : ''}
+            <span>${orderStatusText(o.status)}</span>
+          </div>
+        </div>
+      `).join('');
+    } catch (err) {
+      list.innerHTML = `<p class="text-red-500 text-sm">Lỗi tải đơn: ${err.message}</p>`;
+    }
+  };
+
+  window.copyText = (text) => {
+    navigator.clipboard.writeText(text).then(() => {
+      window.showToast('📋 Đã copy: ' + text);
+    }).catch(() => {
+      window.showToast('❌ Không copy được', 'error');
+    });
+  };
+
+  // ===== ADD ORDER MODAL =====
+  window.openAddOrder = () => {
+    $('#orderModal').classList.remove('hidden');
+    $('#orderModal').classList.add('flex');
+    $('#orderDateInput').value = todayInput();
+  };
+  window.closeOrderModal = () => {
+    $('#orderModal').classList.add('hidden');
+    $('#orderModal').classList.remove('flex');
+    $('#orderForm').reset();
+  };
+
+  window.handleAddOrder = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const btn = form.querySelector('button[type=submit]');
+    btn.disabled = true;
+    btn.innerHTML = '⏳ Đang lưu...';
+
+    try {
+      const orderData = {
+        productName: form.productName.value.trim(),
+        voucherUsed: form.voucherUsed.value.trim(),
+        shopName: form.shopName.value.trim(),
+        price: Number(form.price.value) || 0,
+        orderCode: form.orderCode.value.trim(),
+        orderDate: form.orderDate.value || todayInput(),
+        status: form.status.value,
+        createdAt: serverTimestamp()
+      };
+      await addDoc(collection(db, 'accounts', currentAccountId, 'orders'), orderData);
+
+      // Tăng orderCount
+      await updateDoc(doc(db, 'accounts', currentAccountId), {
+        orderCount: increment(1)
+      });
+
+      window.showToast('✅ Đã thêm đơn hàng!');
+      closeOrderModal();
+      loadOrders(currentAccountId);
+    } catch (err) {
+      window.showToast('❌ ' + err.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '💾 Lưu đơn hàng';
+    }
+  };
+
+  window.deleteOrder = async (accountId, orderId) => {
+    if (!confirm('Xóa đơn hàng này?')) return;
+    try {
+      await deleteDoc(doc(db, 'accounts', accountId, 'orders', orderId));
+      await updateDoc(doc(db, 'accounts', accountId), {
+        orderCount: increment(-1)
+      });
+      window.showToast('🗑️ Đã xóa đơn');
+      loadOrders(accountId);
+    } catch (err) {
+      window.showToast('❌ ' + err.message, 'error');
+    }
+  };
+
+  // ===== DELETE ACCOUNT =====
+  window.deleteAccount = async (id) => {
+    if (!confirm('Bạn chắc chắn muốn xóa tài khoản này?\nTất cả đơn hàng cũng sẽ bị xóa.')) return;
+    try {
+      const ordersSnap = await getDocs(collection(db, 'accounts', id, 'orders'));
+      await Promise.all(ordersSnap.docs.map(d => deleteDoc(d.ref)));
+      await deleteDoc(doc(db, 'accounts', id));
+      window.showToast('🗑️ Đã xóa tài khoản');
+      closeDetail();
+    } catch (err) {
+      window.showToast('❌ ' + err.message, 'error');
+    }
+  };
+
+  // ===== SHOW PASSWORD IN TABLE =====
+  document.addEventListener('click', (e) => {
+    const mask = e.target.closest('.pwd-mask');
+    if (mask) {
+      if (mask.textContent === '••••••') {
+        mask.textContent = mask.dataset.pwd || '';
+        mask.classList.add('text-orange-600');
+      } else {
+        mask.textContent = '••••••';
+        mask.classList.remove('text-orange-600');
+      }
+    }
+  });
+
+  // ===== INIT =====
+  document.addEventListener('DOMContentLoaded', () => {
+    loadAccounts();
+  });
+</script>
+
+<style>
+  body { font-family: 'Inter', -apple-system, sans-serif; }
+  .modal-backdrop { backdrop-filter: blur(4px); }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: #f1f5f9; }
+  ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+  table td { vertical-align: middle; }
+</style>
+</head>
+
+<body class="bg-gray-50 min-h-screen">
+
+<!-- ===== HEADER ===== -->
+<header class="bg-white border-b sticky top-0 z-40 shadow-sm">
+  <div class="max-w-[1400px] mx-auto px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-orange-400 to-orange-600 text-white flex items-center justify-center text-xl shadow">
+        🛒
+      </div>
+      <div>
+        <h1 class="font-bold text-gray-800 text-lg leading-tight">Accounts Shopee</h1>
+        <p class="text-xs text-gray-500">by tuquangnam07</p>
+      </div>
+    </div>
+    <button onclick="openAddModal()"
+      class="px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium rounded-lg shadow transition flex items-center gap-2">
+      <span class="text-lg leading-none">+</span> Thêm Account
+    </button>
+  </div>
+</header>
+
+<!-- ===== MAIN ===== -->
+<main class="max-w-[1400px] mx-auto px-4 py-6">
+
+  <!-- STATS -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+    <div class="bg-white rounded-xl border p-4">
+      <p class="text-xs text-gray-500 mb-1">Tổng tài khoản</p>
+      <p id="statTotal" class="text-2xl font-bold text-gray-800">0</p>
+    </div>
+    <div class="bg-white rounded-xl border p-4">
+      <p class="text-xs text-gray-500 mb-1">Tổng đơn hàng</p>
+      <p id="statOrders" class="text-2xl font-bold text-orange-500">0</p>
+    </div>
+    <div class="bg-white rounded-xl border p-4">
+      <p class="text-xs text-gray-500 mb-1">Đang dùng</p>
+      <p id="statActive" class="text-2xl font-bold text-green-600">0</p>
+    </div>
+    <div class="bg-white rounded-xl border p-4">
+      <p class="text-xs text-gray-500 mb-1">Đã bán</p>
+      <p id="statSold" class="text-2xl font-bold text-red-500">0</p>
+    </div>
+  </div>
+
+  <!-- SEARCH & FILTER -->
+  <div class="flex flex-col md:flex-row gap-3 mb-6">
+    <div class="flex-1 relative">
+      <span class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400">🔍</span>
+      <input oninput="handleSearch(event)" type="text"
+        placeholder="Tìm theo tài khoản, SĐT, email..."
+        class="w-full pl-10 pr-4 py-2.5 bg-white border border-gray-200 rounded-lg focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none"/>
+    </div>
+    <select onchange="handleFilter(event)"
+      class="px-4 py-2.5 bg-white border border-gray-200 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none">
+      <option value="all">Tất cả trạng thái</option>
+      <option value="active">Đang dùng</option>
+      <option value="pending">Chưa mua</option>
+      <option value="bought">Đã mua</option>
+      <option value="sold">Đã bán</option>
+      <option value="locked">Bị khóa</option>
+    </select>
+    <button onclick="toggleView()"
+      class="px-4 py-2.5 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition flex items-center gap-2 text-sm">
+      <span id="viewIcon" class="text-lg leading-none">⊞</span>
+      <span id="viewLabel" class="hidden md:inline">Dạng thẻ</span>
+    </button>
+  </div>
+
+  <!-- ACCOUNTS -->
+  <div id="accountContainer"></div>
+</main>
+
+<!-- ===== MODAL: ADD ACCOUNT ===== -->
+<div id="addModal" class="hidden fixed inset-0 bg-black/50 modal-backdrop z-50 items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+    <div class="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-2xl z-10">
+      <h2 class="text-lg font-bold text-gray-800">➕ Thêm tài khoản Shopee</h2>
+      <button onclick="closeAddModal()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">×</button>
+    </div>
+    <form id="addForm" onsubmit="handleAddAccount(event)" class="p-5 space-y-4">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Tài khoản *</label>
+          <input name="username" required placeholder="aj4dtrmmnq"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Mật khẩu *</label>
+          <input name="password" required placeholder="Quangnam123@"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">SĐT *</label>
+          <input name="phone" required placeholder="(+84)528512667"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+          <input name="email" type="email" placeholder="dragnet_corded_4u@icloud.com"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Thiết bị tạo</label>
+          <input name="deviceCreated" placeholder="Máy Sỹ Ngà"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Thiết bị mua</label>
+          <input name="deviceBought" placeholder="Máy Sỹ Ngà"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Ngày tạo acc *</label>
+          <input id="createdAtInput" name="accountCreatedAt" type="date" required
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Ngày mua acc</label>
+          <input name="accountBoughtAt" type="date"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none"/>
+        </div>
+        <div class="md:col-span-2">
+          <label class="block text-sm font-medium text-gray-700 mb-1">Trạng thái *</label>
+          <select name="status" required
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none">
+            <option value="pending">Chưa mua</option>
+            <option value="active">Đang dùng</option>
+            <option value="bought">Đã mua</option>
+            <option value="sold">Đã bán</option>
+            <option value="locked">Bị khóa</option>
+          </select>
+        </div>
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Ghi chú</label>
+        <textarea name="note" rows="2" placeholder="Ghi chú thêm..."
+          class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none"></textarea>
+      </div>
+      <div class="bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-700">
+        💡 <strong>Lưu ý:</strong> Voucher sẽ được nhập khi bạn thêm đơn hàng cho tài khoản này (trong tab "Đơn hàng").
+      </div>
+      <div class="flex justify-end gap-3 pt-2">
+        <button type="button" onclick="closeAddModal()"
+          class="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg transition">Hủy</button>
+        <button type="submit"
+          class="px-5 py-2 bg-orange-500 hover:bg-orange-600 text-white font-medium rounded-lg shadow transition">
+          💾 Lưu tài khoản
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ===== MODAL: DETAIL ===== -->
+<div id="detailModal" class="hidden fixed inset-0 bg-black/50 modal-backdrop z-50 items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-y-auto">
+    <div class="p-5 border-b flex items-center gap-4 sticky top-0 bg-white rounded-t-2xl z-10">
+      <div id="detailAvatar" class="w-12 h-12 rounded-full bg-gradient-to-br from-orange-400 to-orange-600 text-white flex items-center justify-center font-bold text-xl shadow">?</div>
+      <div class="flex-1">
+        <h2 id="detailName" class="font-bold text-gray-800 text-lg">Tài khoản</h2>
+        <p id="detailPhone" class="text-xs text-gray-500">—</p>
+      </div>
+      <button onclick="closeDetail()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">×</button>
+    </div>
+
+    <div class="flex border-b overflow-x-auto">
+      <button data-tab="info" onclick="switchTab('info')" class="tab-btn">📋 Thông tin</button>
+      <button data-tab="orders" onclick="switchTab('orders')" class="tab-btn">📦 Đơn hàng</button>
+    </div>
+
+    <div id="detailContent" class="p-5"></div>
+  </div>
+</div>
+
+<!-- ===== MODAL: ADD ORDER ===== -->
+<div id="orderModal" class="hidden fixed inset-0 bg-black/50 modal-backdrop z-[60] items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+    <div class="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-2xl z-10">
+      <h2 class="text-lg font-bold text-gray-800">➕ Thêm đơn hàng</h2>
+      <button onclick="closeOrderModal()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">×</button>
+    </div>
+    <form id="orderForm" onsubmit="handleAddOrder(event)" class="p-5 space-y-4">
+      <div class="grid grid-cols-2 gap-4">
+        <div class="col-span-2">
+          <label class="block text-sm font-medium text-gray-700 mb-1">Tên sản phẩm *</label>
+          <input name="productName" required placeholder="Pin 32140 - 1C"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none"/>
+        </div>
+        <div class="col-span-2">
+          <label class="block text-sm font-medium text-gray-700 mb-1">🎟️ Voucher đã dùng</label>
+          <input name="voucherUsed" placeholder="100KHSSEPW4B9WO1"
+            class="w-full px-3 py-2 border border-orange-300 bg-orange-50 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none font-mono text-sm"/>
+          <p class="text-xs text-gray-400 mt-1">Nhập mã voucher đã dùng cho đơn hàng này</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Tên shop</label>
+          <input name="shopName" placeholder="Shop ABC"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Giá (đ)</label>
+          <input name="price" type="number" placeholder="150000"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Mã đơn hàng</label>
+          <input name="orderCode" placeholder="SP123456"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Ngày đặt</label>
+          <input id="orderDateInput" name="orderDate" type="date"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none"/>
+        </div>
+        <div class="col-span-2">
+          <label class="block text-sm font-medium text-gray-700 mb-1">Trạng thái</label>
+          <select name="status"
+            class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none">
+            <option value="pending">Chờ xử lý</option>
+            <option value="shipping">Đang giao</option>
+            <option value="done">Hoàn thành</option>
+            <option value="cancel">Đã hủy</option>
+          </select>
+        </div>
+      </div>
+      <div class="flex justify-end gap-3 pt-2">
+        <button type="button" onclick="closeOrderModal()"
+          class="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg transition">Hủy</button>
+        <button type="submit"
+          class="px-5 py-2 bg-orange-500 hover:bg-orange-600 text-white font-medium rounded-lg shadow transition">
+          💾 Lưu đơn hàng
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+</body>
+</html>
