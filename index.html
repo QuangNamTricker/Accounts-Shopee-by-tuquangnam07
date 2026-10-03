@@ -11,7 +11,7 @@
   import {
     getFirestore, collection, addDoc, getDocs, doc, deleteDoc,
     updateDoc, onSnapshot, query, orderBy, serverTimestamp,
-    increment
+    increment, getDoc
   } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
   // ===== FIREBASE CONFIG =====
@@ -34,7 +34,8 @@
   let currentTab = 'info';
   let searchTerm = '';
   let filterStatus = 'all';
-  let viewMode = 'table'; // 'table' | 'card'
+  let viewMode = 'table';
+  let editingOrderId = null; // null = thêm mới, string = đang sửa
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
@@ -61,9 +62,7 @@
   const formatDate = (d) => {
     if (!d) return '—';
     try {
-      // Nếu là Timestamp Firestore
       if (d.toDate) d = d.toDate();
-      // Nếu là string dd/mm/yyyy hoặc yyyy-mm-dd
       if (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)) {
         const [y, m, day] = d.split('-');
         return `${day}/${m}/${y}`;
@@ -82,16 +81,13 @@
     return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   };
 
-  // ===== STATUS BADGE =====
+  // ===== STATUS BADGE (chỉ còn 2 trạng thái) =====
   const statusBadge = (status) => {
     const map = {
-      active:  { text: 'Đang dùng',  cls: 'bg-green-100 text-green-700 border-green-300',   dot: 'bg-green-500' },
-      pending: { text: 'Chưa mua',   cls: 'bg-yellow-100 text-yellow-700 border-yellow-300', dot: 'bg-yellow-500' },
-      bought:  { text: 'Đã mua',     cls: 'bg-blue-100 text-blue-700 border-blue-300',      dot: 'bg-blue-500' },
-      sold:    { text: 'Đã bán',     cls: 'bg-red-100 text-red-700 border-red-300',         dot: 'bg-red-500' },
-      locked:  { text: 'Bị khóa',    cls: 'bg-gray-100 text-gray-700 border-gray-300',      dot: 'bg-gray-500' },
+      bought: { text: 'Đã mua',  cls: 'bg-green-100 text-green-700 border-green-300', dot: 'bg-green-500' },
+      notbought: { text: 'Chưa mua', cls: 'bg-gray-100 text-gray-700 border-gray-300', dot: 'bg-gray-500' },
     };
-    const s = map[status] || map.pending;
+    const s = map[status] || map.notbought;
     return `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full border ${s.cls} whitespace-nowrap">
       <span class="w-1.5 h-1.5 rounded-full ${s.dot}"></span>${s.text}
     </span>`;
@@ -108,21 +104,47 @@
     return `<span class="px-2 py-0.5 text-xs rounded-full ${s.cls}">${s.text}</span>`;
   };
 
-  // ===== ADD ACCOUNT MODAL =====
+  // ===== ADD/EDIT ACCOUNT MODAL =====
   window.openAddModal = () => {
+    $('#addModalTitle').textContent = '➕ Thêm tài khoản Shopee';
+    $('#addForm').reset();
+    $('#addForm').dataset.editId = '';
+    $('#createdAtInput').value = todayInput();
     $('#addModal').classList.remove('hidden');
     $('#addModal').classList.add('flex');
-    $('#createdAtInput').value = todayInput();
   };
+
+  window.openEditAccountModal = (id) => {
+    const acc = accounts.find(a => a.id === id);
+    if (!acc) return;
+    $('#addModalTitle').textContent = '✏️ Sửa tài khoản Shopee';
+    const form = $('#addForm');
+    form.username.value = acc.username || '';
+    form.password.value = acc.password || '';
+    form.phone.value = acc.phone || '';
+    form.email.value = acc.email || '';
+    form.deviceCreated.value = acc.deviceCreated || '';
+    form.deviceBought.value = acc.deviceBought || '';
+    form.accountCreatedAt.value = acc.accountCreatedAt || '';
+    form.accountBoughtAt.value = acc.accountBoughtAt || '';
+    form.status.value = acc.status || 'notbought';
+    form.note.value = acc.note || '';
+    form.dataset.editId = id;
+    $('#addModal').classList.remove('hidden');
+    $('#addModal').classList.add('flex');
+  };
+
   window.closeAddModal = () => {
     $('#addModal').classList.add('hidden');
     $('#addModal').classList.remove('flex');
     $('#addForm').reset();
+    $('#addForm').dataset.editId = '';
   };
 
   window.handleAddAccount = async (e) => {
     e.preventDefault();
     const btn = e.target.querySelector('button[type=submit]');
+    const editId = e.target.dataset.editId;
     btn.disabled = true;
     btn.innerHTML = '⏳ Đang lưu...';
 
@@ -138,14 +160,23 @@
         accountCreatedAt: form.accountCreatedAt.value || '',
         accountBoughtAt: form.accountBoughtAt.value || '',
         status: form.status.value,
-        note: form.note.value.trim(),
-        orderCount: 0,
-        createdAtServer: serverTimestamp()
+        note: form.note.value.trim()
       };
 
-      await addDoc(collection(db, 'accounts'), data);
-      window.showToast('✅ Đã thêm tài khoản!');
+      if (editId) {
+        await updateDoc(doc(db, 'accounts', editId), data);
+        window.showToast('✅ Đã cập nhật tài khoản!');
+      } else {
+        data.orderCount = 0;
+        data.createdAtServer = serverTimestamp();
+        await addDoc(collection(db, 'accounts'), data);
+        window.showToast('✅ Đã thêm tài khoản!');
+      }
       closeAddModal();
+      // Nếu đang mở chi tiết chính acc này → refresh
+      if (editId && currentAccountId === editId) {
+        setTimeout(() => renderDetail(), 300);
+      }
     } catch (err) {
       console.error(err);
       window.showToast('❌ Lỗi: ' + err.message, 'error');
@@ -176,18 +207,17 @@
   const renderStats = () => {
     const total = accounts.length;
     const totalOrders = accounts.reduce((s, a) => s + (a.orderCount || 0), 0);
-    const active = accounts.filter(a => a.status === 'active' || a.status === 'bought').length;
-    const sold = accounts.filter(a => a.status === 'sold').length;
+    const bought = accounts.filter(a => a.status === 'bought').length;
+    const notBought = accounts.filter(a => a.status !== 'bought').length;
     $('#statTotal').textContent = total;
     $('#statOrders').textContent = totalOrders;
-    $('#statActive').textContent = active;
-    $('#statSold').textContent = sold;
+    $('#statBought').textContent = bought;
+    $('#statNotBought').textContent = notBought;
   };
 
-  // ===== RENDER ACCOUNTS (TABLE VIEW - giống Excel) =====
+  // ===== RENDER ACCOUNTS =====
   const renderAccounts = () => {
     let list = accounts;
-
     if (searchTerm) {
       const t = searchTerm.toLowerCase();
       list = list.filter(a =>
@@ -196,12 +226,9 @@
         (a.email || '').toLowerCase().includes(t)
       );
     }
-    if (filterStatus !== 'all') {
-      list = list.filter(a => a.status === filterStatus);
-    }
+    if (filterStatus !== 'all') list = list.filter(a => a.status === filterStatus);
 
     const container = $('#accountContainer');
-
     if (list.length === 0) {
       container.innerHTML = `
         <div class="text-center py-20 text-gray-400">
@@ -233,18 +260,17 @@
               </thead>
               <tbody class="divide-y divide-gray-100">
                 ${list.map(a => `
-                  <tr onclick="openDetail('${a.id}')"
-                    class="hover:bg-orange-50/50 cursor-pointer transition">
+                  <tr onclick="openDetail('${a.id}')" class="hover:bg-orange-50/50 cursor-pointer transition">
                     <td class="px-3 py-3 font-medium text-gray-800">
                       <div class="flex items-center gap-2">
                         <div class="w-7 h-7 rounded-full bg-gradient-to-br from-orange-400 to-orange-600 text-white flex items-center justify-center font-bold text-xs flex-shrink-0">
-                          ${(a.username || '?')[0].toUpperCase()}
+                          ${escapeHtml((a.username || '?')[0].toUpperCase())}
                         </div>
                         <span>${escapeHtml(a.username || 'N/A')}</span>
                       </div>
                     </td>
                     <td class="px-3 py-3 text-gray-600 font-mono text-xs">
-                      <span class="pwd-mask" data-pwd="${escapeHtml(a.password || '')}">••••••</span>
+                      <span class="pwd-mask cursor-pointer select-none" data-pwd="${escapeHtml(a.password || '')}">••••••</span>
                     </td>
                     <td class="px-3 py-3 text-gray-600 whitespace-nowrap">${escapeHtml(a.phone || '—')}</td>
                     <td class="px-3 py-3 text-gray-600 max-w-[180px] truncate">${escapeHtml(a.email || '—')}</td>
@@ -263,8 +289,7 @@
               </tbody>
             </table>
           </div>
-        </div>
-      `;
+        </div>`;
     } else {
       container.innerHTML = `
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -275,7 +300,7 @@
                 <div class="flex items-start justify-between mb-3">
                   <div class="flex items-center gap-3">
                     <div class="w-11 h-11 rounded-full bg-gradient-to-br from-orange-400 to-orange-600 text-white flex items-center justify-center font-bold text-lg shadow">
-                      ${(a.username || '?')[0].toUpperCase()}
+                      ${escapeHtml((a.username || '?')[0].toUpperCase())}
                     </div>
                     <div>
                       <h3 class="font-semibold text-gray-800 group-hover:text-orange-600 transition">
@@ -307,8 +332,7 @@
               </div>
             </div>
           `).join('')}
-        </div>
-      `;
+        </div>`;
     }
   };
 
@@ -353,9 +377,7 @@
     $$('.tab-btn').forEach(b => {
       const isActive = b.dataset.tab === currentTab;
       b.className = `tab-btn px-5 py-3 font-medium border-b-2 transition whitespace-nowrap ${
-        isActive
-          ? 'border-orange-500 text-orange-600'
-          : 'border-transparent text-gray-500 hover:text-gray-700'
+        isActive ? 'border-orange-500 text-orange-600' : 'border-transparent text-gray-500 hover:text-gray-700'
       }`;
     });
 
@@ -383,16 +405,19 @@
           </div>
           ${acc.note ? `<div class="md:col-span-2">
             <p class="text-xs text-gray-500 mb-1">📝 Ghi chú</p>
-            <p class="text-sm text-gray-700 bg-gray-50 rounded-lg p-3">${escapeHtml(acc.note)}</p>
+            <p class="text-sm text-gray-700 bg-gray-50 rounded-lg p-3 whitespace-pre-wrap">${escapeHtml(acc.note)}</p>
           </div>` : ''}
         </div>
-        <div class="flex justify-end mt-6 pt-4 border-t">
+        <div class="flex justify-between items-center mt-6 pt-4 border-t">
           <button onclick="deleteAccount('${acc.id}')"
             class="px-4 py-2 text-sm text-red-600 border border-red-300 rounded-lg hover:bg-red-50 transition">
             🗑️ Xóa tài khoản
           </button>
-        </div>
-      `;
+          <button onclick="openEditAccountModal('${acc.id}')"
+            class="px-5 py-2 bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium rounded-lg shadow transition">
+            ✏️ Sửa tài khoản
+          </button>
+        </div>`;
     } else if (currentTab === 'orders') {
       content.innerHTML = `
         <div class="flex justify-between items-center mb-4">
@@ -407,8 +432,7 @@
         </div>
         <div id="ordersList" class="space-y-3">
           <div class="text-center py-10 text-gray-400">⏳ Đang tải đơn hàng...</div>
-        </div>
-      `;
+        </div>`;
       await loadOrders(acc.id);
     }
   };
@@ -418,18 +442,19 @@
       <p class="text-xs text-gray-500 mb-1">${label}</p>
       ${isPassword && value
         ? `<div class="flex items-center gap-2">
-            <span class="text-sm font-medium text-gray-800 font-mono" data-pwd>••••••••</span>
-            <button onclick="togglePwd(this, '${escapeHtml(value).replace(/'/g, "\\'")}')"
+            <span class="text-sm font-medium text-gray-800 font-mono" data-pwd-view>••••••••</span>
+            <button onclick="togglePwdField(this)"
+              data-real="${escapeHtml(value)}"
               class="text-xs text-orange-500 hover:underline">Hiện</button>
           </div>`
         : `<p class="text-sm font-medium text-gray-800 break-words">${escapeHtml(value || '—')}</p>`}
-    </div>
-  `;
+    </div>`;
 
-  window.togglePwd = (btn, pwd) => {
-    const span = btn.previousElementSibling;
+  window.togglePwdField = (btn) => {
+    const span = btn.parentElement.querySelector('[data-pwd-view]');
+    if (!span) return;
     if (span.textContent === '••••••••') {
-      span.textContent = pwd;
+      span.textContent = btn.dataset.real;
       btn.textContent = 'Ẩn';
     } else {
       span.textContent = '••••••••';
@@ -468,19 +493,26 @@
                 ${o.orderCode ? `<p class="text-xs text-gray-400 mt-0.5">Mã đơn: <span class="font-mono">${escapeHtml(o.orderCode)}</span></p>` : ''}
               </div>
             </div>
-            <button onclick="deleteOrder('${accountId}', '${o.id}', ${o._orderCount || 0})"
-              class="text-red-400 hover:text-red-600 text-sm flex-shrink-0">🗑️</button>
+            <div class="flex items-center gap-1 flex-shrink-0">
+              <button onclick="event.stopPropagation(); openEditOrder('${accountId}', '${o.id}')"
+                title="Sửa đơn"
+                class="p-1.5 text-blue-500 hover:text-blue-700 hover:bg-blue-50 rounded transition">✏️</button>
+              <button onclick="event.stopPropagation(); deleteOrder('${accountId}', '${o.id}')"
+                title="Xóa đơn"
+                class="p-1.5 text-red-400 hover:text-red-600 hover:bg-red-50 rounded transition">🗑️</button>
+            </div>
           </div>
 
           ${o.voucherUsed ? `
             <div class="mt-3 flex items-center gap-2 bg-gradient-to-r from-orange-50 to-yellow-50 border border-orange-200 rounded-lg p-2.5">
               <span class="text-lg">🎟️</span>
-              <div class="flex-1">
+              <div class="flex-1 min-w-0">
                 <p class="text-xs text-gray-500">Voucher đã dùng</p>
-                <p class="font-mono text-sm font-bold text-orange-700">${escapeHtml(o.voucherUsed)}</p>
+                <p class="font-mono text-sm font-bold text-orange-700 break-all">${escapeHtml(o.voucherUsed)}</p>
               </div>
-              <button onclick="copyText('${escapeHtml(o.voucherUsed).replace(/'/g, "\\'")}')"
-                class="px-2 py-1 text-xs bg-white border border-orange-300 text-orange-600 rounded hover:bg-orange-50 transition">
+              <button onclick="event.stopPropagation(); copyText(this.dataset.v)"
+                data-v="${escapeHtml(o.voucherUsed)}"
+                class="px-2 py-1 text-xs bg-white border border-orange-300 text-orange-600 rounded hover:bg-orange-50 transition flex-shrink-0">
                 📋 Copy
               </button>
             </div>
@@ -500,6 +532,7 @@
   };
 
   window.copyText = (text) => {
+    if (!text) return;
     navigator.clipboard.writeText(text).then(() => {
       window.showToast('📋 Đã copy: ' + text);
     }).catch(() => {
@@ -507,16 +540,50 @@
     });
   };
 
-  // ===== ADD ORDER MODAL =====
+  // ===== ADD/EDIT ORDER MODAL =====
   window.openAddOrder = () => {
+    if (!currentAccountId) {
+      window.showToast('❌ Chưa chọn tài khoản', 'error');
+      return;
+    }
+    editingOrderId = null;
+    $('#orderModalTitle').textContent = '➕ Thêm đơn hàng';
+    $('#orderForm').reset();
+    $('#orderDateInput').value = todayInput();
     $('#orderModal').classList.remove('hidden');
     $('#orderModal').classList.add('flex');
-    $('#orderDateInput').value = todayInput();
   };
+
+  window.openEditOrder = async (accountId, orderId) => {
+    editingOrderId = orderId;
+    $('#orderModalTitle').textContent = '✏️ Sửa đơn hàng';
+    try {
+      const snap = await getDoc(doc(db, 'accounts', accountId, 'orders', orderId));
+      if (!snap.exists()) {
+        window.showToast('❌ Không tìm thấy đơn', 'error');
+        return;
+      }
+      const o = snap.data();
+      const form = $('#orderForm');
+      form.productName.value = o.productName || '';
+      form.voucherUsed.value = o.voucherUsed || '';
+      form.shopName.value = o.shopName || '';
+      form.price.value = o.price || '';
+      form.orderCode.value = o.orderCode || '';
+      form.orderDate.value = o.orderDate || '';
+      form.status.value = o.status || 'pending';
+      $('#orderModal').classList.remove('hidden');
+      $('#orderModal').classList.add('flex');
+    } catch (err) {
+      window.showToast('❌ ' + err.message, 'error');
+    }
+  };
+
   window.closeOrderModal = () => {
     $('#orderModal').classList.add('hidden');
     $('#orderModal').classList.remove('flex');
     $('#orderForm').reset();
+    editingOrderId = null;
   };
 
   window.handleAddOrder = async (e) => {
@@ -534,17 +601,21 @@
         price: Number(form.price.value) || 0,
         orderCode: form.orderCode.value.trim(),
         orderDate: form.orderDate.value || todayInput(),
-        status: form.status.value,
-        createdAt: serverTimestamp()
+        status: form.status.value
       };
-      await addDoc(collection(db, 'accounts', currentAccountId, 'orders'), orderData);
 
-      // Tăng orderCount
-      await updateDoc(doc(db, 'accounts', currentAccountId), {
-        orderCount: increment(1)
-      });
+      if (editingOrderId) {
+        // Sửa đơn — không đổi orderCount
+        await updateDoc(doc(db, 'accounts', currentAccountId, 'orders', editingOrderId), orderData);
+        window.showToast('✅ Đã cập nhật đơn hàng!');
+      } else {
+        // Thêm đơn mới — tăng orderCount
+        orderData.createdAt = serverTimestamp();
+        await addDoc(collection(db, 'accounts', currentAccountId, 'orders'), orderData);
+        await updateDoc(doc(db, 'accounts', currentAccountId), { orderCount: increment(1) });
+        window.showToast('✅ Đã thêm đơn hàng!');
+      }
 
-      window.showToast('✅ Đã thêm đơn hàng!');
       closeOrderModal();
       loadOrders(currentAccountId);
     } catch (err) {
@@ -555,13 +626,13 @@
     }
   };
 
+  // ===== DELETE ORDER (đếm lại chính xác, không âm) =====
   window.deleteOrder = async (accountId, orderId) => {
     if (!confirm('Xóa đơn hàng này?')) return;
     try {
       await deleteDoc(doc(db, 'accounts', accountId, 'orders', orderId));
-      await updateDoc(doc(db, 'accounts', accountId), {
-        orderCount: increment(-1)
-      });
+      const remaining = await getDocs(collection(db, 'accounts', accountId, 'orders'));
+      await updateDoc(doc(db, 'accounts', accountId), { orderCount: remaining.size });
       window.showToast('🗑️ Đã xóa đơn');
       loadOrders(accountId);
     } catch (err) {
@@ -583,10 +654,11 @@
     }
   };
 
-  // ===== SHOW PASSWORD IN TABLE =====
+  // ===== SHOW PASSWORD IN TABLE (click) =====
   document.addEventListener('click', (e) => {
     const mask = e.target.closest('.pwd-mask');
     if (mask) {
+      e.stopPropagation();
       if (mask.textContent === '••••••') {
         mask.textContent = mask.dataset.pwd || '';
         mask.classList.add('text-orange-600');
@@ -649,12 +721,12 @@
       <p id="statOrders" class="text-2xl font-bold text-orange-500">0</p>
     </div>
     <div class="bg-white rounded-xl border p-4">
-      <p class="text-xs text-gray-500 mb-1">Đang dùng</p>
-      <p id="statActive" class="text-2xl font-bold text-green-600">0</p>
+      <p class="text-xs text-gray-500 mb-1">Đã mua</p>
+      <p id="statBought" class="text-2xl font-bold text-green-600">0</p>
     </div>
     <div class="bg-white rounded-xl border p-4">
-      <p class="text-xs text-gray-500 mb-1">Đã bán</p>
-      <p id="statSold" class="text-2xl font-bold text-red-500">0</p>
+      <p class="text-xs text-gray-500 mb-1">Chưa mua</p>
+      <p id="statNotBought" class="text-2xl font-bold text-gray-500">0</p>
     </div>
   </div>
 
@@ -669,11 +741,8 @@
     <select onchange="handleFilter(event)"
       class="px-4 py-2.5 bg-white border border-gray-200 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none">
       <option value="all">Tất cả trạng thái</option>
-      <option value="active">Đang dùng</option>
-      <option value="pending">Chưa mua</option>
       <option value="bought">Đã mua</option>
-      <option value="sold">Đã bán</option>
-      <option value="locked">Bị khóa</option>
+      <option value="notbought">Chưa mua</option>
     </select>
     <button onclick="toggleView()"
       class="px-4 py-2.5 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition flex items-center gap-2 text-sm">
@@ -686,11 +755,11 @@
   <div id="accountContainer"></div>
 </main>
 
-<!-- ===== MODAL: ADD ACCOUNT ===== -->
+<!-- ===== MODAL: ADD/EDIT ACCOUNT ===== -->
 <div id="addModal" class="hidden fixed inset-0 bg-black/50 modal-backdrop z-50 items-center justify-center p-4">
   <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
     <div class="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-2xl z-10">
-      <h2 class="text-lg font-bold text-gray-800">➕ Thêm tài khoản Shopee</h2>
+      <h2 id="addModalTitle" class="text-lg font-bold text-gray-800">➕ Thêm tài khoản Shopee</h2>
       <button onclick="closeAddModal()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">×</button>
     </div>
     <form id="addForm" onsubmit="handleAddAccount(event)" class="p-5 space-y-4">
@@ -739,11 +808,8 @@
           <label class="block text-sm font-medium text-gray-700 mb-1">Trạng thái *</label>
           <select name="status" required
             class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-400 outline-none">
-            <option value="pending">Chưa mua</option>
-            <option value="active">Đang dùng</option>
+            <option value="notbought">Chưa mua</option>
             <option value="bought">Đã mua</option>
-            <option value="sold">Đã bán</option>
-            <option value="locked">Bị khóa</option>
           </select>
         </div>
       </div>
@@ -788,11 +854,11 @@
   </div>
 </div>
 
-<!-- ===== MODAL: ADD ORDER ===== -->
+<!-- ===== MODAL: ADD/EDIT ORDER ===== -->
 <div id="orderModal" class="hidden fixed inset-0 bg-black/50 modal-backdrop z-[60] items-center justify-center p-4">
   <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
     <div class="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-2xl z-10">
-      <h2 class="text-lg font-bold text-gray-800">➕ Thêm đơn hàng</h2>
+      <h2 id="orderModalTitle" class="text-lg font-bold text-gray-800">➕ Thêm đơn hàng</h2>
       <button onclick="closeOrderModal()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">×</button>
     </div>
     <form id="orderForm" onsubmit="handleAddOrder(event)" class="p-5 space-y-4">
