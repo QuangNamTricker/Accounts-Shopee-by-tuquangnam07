@@ -2,11 +2,21 @@
 <html lang="vi">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Accounts Shopee — Quản Lý Tài Khoản</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#f97316" />
+<meta name="description" content="Quản lý tài khoản Shopee và đơn hàng — PWA" />
+<title>Accounts Shopee — Quản Lý Tài Khoản v1.0</title>
+
+<!-- PWA -->
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="Shopee Acc" />
 
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script>
   tailwind.config = {
     theme: {
@@ -42,9 +52,18 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import {
     getFirestore, collection, addDoc, getDocs, doc, deleteDoc,
-    updateDoc, onSnapshot, query, orderBy, serverTimestamp,
-    increment, getDoc, writeBatch
+    updateDoc, onSnapshot, query, serverTimestamp,
+    increment, getDoc, writeBatch, setDoc
   } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import {
+    getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+  // ===== CẤU HÌNH =====
+  const APP_VERSION = '1.0';
+  const REQUIRE_AUTH = false;               // Bật true nếu đã setup Firebase Auth
+  const ENCRYPT_KEY = 'shopee-mgr-2024-secret'; // Đổi key thành của bạn
+  const CACHE_TTL_MS = 5 * 60 * 1000;       // Cache orders 5 phút
 
   // ===== FIREBASE =====
   const firebaseConfig = {
@@ -58,23 +77,55 @@
   };
   const app = initializeApp(firebaseConfig);
   const db = getFirestore(app);
+  const auth = getAuth(app);
 
   // ===== STATE =====
   let accounts = [];
-  let allOrdersCache = {}; // { accountId: [orders] }
+  let allOrdersCache = {};         // { accountId: [orders] }
+  let ordersCacheTime = {};        // { accountId: timestamp }
   let currentAccountId = null;
   let currentTab = 'info';
-  let currentPage = 'accounts'; // accounts | dashboard
+  let currentPage = 'accounts';
   let searchTerm = '';
   let filterStatus = 'all';
   let viewMode = localStorage.getItem('viewMode') || 'table';
   let editingOrderId = null;
+  let editingAccountId = null;     // FIX: lưu riêng account đang sửa
   let sortBy = 'newest';
   let currentOrder = null;
   let charts = {};
 
+  // Cache managers (tránh chạy song song)
+  let accountsUnsub = null;        // unsubscribe onSnapshot accounts
+  let loadingOrdersPromise = null; // tránh load song song
+  let isOnline = navigator.onLine;
+
   const $  = (s) => document.querySelector(s);
   const $$ = (s) => document.querySelectorAll(s);
+
+  // ===== MÃ HÓA (XOR + Base64) =====
+  const encrypt = (plain) => {
+    if (!plain) return '';
+    try {
+      let out = '';
+      for (let i = 0; i < plain.length; i++) {
+        out += String.fromCharCode(plain.charCodeAt(i) ^ ENCRYPT_KEY.charCodeAt(i % ENCRYPT_KEY.length));
+      }
+      return 'enc:' + btoa(unescape(encodeURIComponent(out)));
+    } catch { return plain; }
+  };
+  const decrypt = (cipher) => {
+    if (!cipher) return '';
+    if (!cipher.startsWith('enc:')) return cipher;
+    try {
+      const raw = decodeURIComponent(escape(atob(cipher.slice(4))));
+      let out = '';
+      for (let i = 0; i < raw.length; i++) {
+        out += String.fromCharCode(raw.charCodeAt(i) ^ ENCRYPT_KEY.charCodeAt(i % ENCRYPT_KEY.length));
+      }
+      return out;
+    } catch { return cipher; }
+  };
 
   // ===== TOAST =====
   window.showToast = (msg, type = 'success') => {
@@ -122,6 +173,25 @@
     return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   };
 
+  // ===== CACHE INVALIDATION =====
+  // Chỉ gọi khi orders của 1 account (hoặc tất cả) bị thay đổi bởi CHÍNH user
+  const invalidateOrders = (accountId = null) => {
+    if (accountId) {
+      delete allOrdersCache[accountId];
+      delete ordersCacheTime[accountId];
+    } else {
+      allOrdersCache = {};
+      ordersCacheTime = {};
+    }
+  };
+
+  // Check xem cache orders còn "tươi" không
+  const isOrdersCacheFresh = (accountId) => {
+    if (!allOrdersCache[accountId]) return false;
+    const t = ordersCacheTime[accountId] || 0;
+    return (Date.now() - t) < CACHE_TTL_MS;
+  };
+
   // ===== COPY =====
   window.copyValue = (text, label = '') => {
     if (text === null || text === undefined || text === '') {
@@ -152,7 +222,6 @@
 
   // ===== STATUS =====
   const statusBadge = (status, errorCode) => {
-    // Gộp "Lỗi F02" vào chung badge
     const map = {
       bought:    { text:'Đã mua',  cls:'bg-emerald-50 text-emerald-700 border-emerald-200', dot:'bg-emerald-500' },
       notbought: { text:'Chưa mua', cls:'bg-slate-100 text-slate-600 border-slate-200',    dot:'bg-slate-400' },
@@ -178,7 +247,7 @@
     return `<span class="px-2 py-0.5 text-[11px] font-medium rounded-full ${s.cls}">${s.text}</span>`;
   };
 
-  // ===== PASSWORD =====
+  // ===== PASSWORD TOGGLE =====
   window.togglePwdField = (btn) => {
     const span = btn.parentElement.querySelector('[data-pwd-view]');
     if (!span) return;
@@ -189,7 +258,7 @@
     }
   };
 
-  // ===== MODAL HELPERS =====
+  // ===== MODAL =====
   window.openModal = (id) => {
     const m = document.getElementById(id);
     if (!m) return;
@@ -207,10 +276,8 @@
     document.body.style.overflow = '';
   };
 
-  // ESC
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    // Đóng dropdown menu nếu có
     closeAppMenu();
     ['addModal','detailModal','orderModal','orderDetailModal'].forEach(id => {
       const m = document.getElementById(id);
@@ -223,7 +290,7 @@
     });
   });
 
-  // ===== HEADER APP MENU =====
+  // ===== APP MENU =====
   window.toggleAppMenu = (e) => {
     e.stopPropagation();
     const menu = $('#appMenu');
@@ -239,28 +306,21 @@
     const menu = $('#appMenu');
     if (menu) menu.classList.add('hidden');
   };
-  document.addEventListener('click', (e) => {
-    const menu = $('#appMenu');
-    if (!menu || menu.classList.contains('hidden')) return;
-    if (!e.target.closest('#appMenu') && !e.target.closest('#appMenuBtn')) closeAppMenu();
-  });
 
   // ===== PAGE SWITCH =====
   window.switchPage = (page) => {
     currentPage = page;
     closeAppMenu();
-    // Update nav active state
     document.querySelectorAll('[data-nav]').forEach(el => {
       const isActive = el.dataset.nav === page;
       el.className = isActive
         ? 'px-3 py-2 rounded-xl text-sm font-semibold text-brand-600 bg-brand-50 flex items-center gap-1.5 transition'
         : 'px-3 py-2 rounded-xl text-sm font-semibold text-slate-500 hover:text-slate-800 hover:bg-slate-100 flex items-center gap-1.5 transition';
     });
-    // Toggle main sections
     if (page === 'dashboard') {
       $('#dashboardView').classList.remove('hidden');
       $('#accountsView').classList.add('hidden');
-      renderDashboard();
+      renderDashboard(); // renderDashboard tự check cache
     } else {
       $('#dashboardView').classList.add('hidden');
       $('#accountsView').classList.remove('hidden');
@@ -278,19 +338,16 @@
   };
 
   window.openEditAccountModal = (id) => {
-    // FIX: đóng detail trước để tránh đè
-    if (!$('#detailModal').classList.contains('hidden')) {
-      closeModal('detailModal');
-    }
+    if (!$('#detailModal').classList.contains('hidden')) closeModal('detailModal');
     const acc = accounts.find(a => a.id === id);
     if (!acc) return;
     $('#addModalTitle').textContent = 'Sửa tài khoản Shopee';
     const form = $('#addForm');
     form.username.value = acc.username || '';
-    form.password.value = acc.password || '';
+    form.password.value = acc._passwordPlain || '';
     form.phone.value = acc.phone || '';
     form.email.value = acc.email || '';
-    form.cookies.value = acc.cookies || '';
+    form.cookies.value = acc._cookiesPlain || '';
     form.deviceCreated.value = acc.deviceCreated || '';
     form.deviceBought.value = acc.deviceBought || '';
     form.accountCreatedAt.value = acc.accountCreatedAt || '';
@@ -333,10 +390,10 @@
       const status = form.status.value;
       const data = {
         username: form.username.value.trim(),
-        password: form.password.value.trim(),
+        password: encrypt(form.password.value.trim()),
         phone: form.phone.value.trim(),
         email: form.email.value.trim(),
-        cookies: form.cookies.value.trim(),
+        cookies: encrypt(form.cookies.value.trim()),
         deviceCreated: form.deviceCreated.value.trim(),
         deviceBought: form.deviceBought.value.trim(),
         accountCreatedAt: form.accountCreatedAt.value || '',
@@ -361,38 +418,91 @@
     }
   };
 
-  // ===== LOAD =====
+  // ===== LOAD ACCOUNTS (1 listener duy nhất) =====
   const loadAccounts = () => {
-    const q = query(collection(db,'accounts'), orderBy('createdAtServer','desc'));
-    onSnapshot(q, (snap) => {
-      accounts = snap.docs.map(d => ({ id:d.id, ...d.data() }));
-      renderAccounts(); renderStats();
+    // FIX: hủy listener cũ nếu có, tránh subscribe trùng
+    if (accountsUnsub) {
+      try { accountsUnsub(); } catch {}
+      accountsUnsub = null;
+    }
+    // FIX: KHÔNG orderBy('createdAtServer') để tránh miss docs thiếu field
+    // Sort client-side thay vì
+    const q = query(collection(db,'accounts'));
+    accountsUnsub = onSnapshot(q, (snap) => {
+      accounts = snap.docs.map(d => ({ id:d.id, ...d.data() }))
+        .map(a => ({
+          ...a,
+          _passwordPlain: decrypt(a.password || ''),
+          _cookiesPlain: decrypt(a.cookies || '')
+        }))
+        .sort((a,b) => {
+          const ta = a.createdAtServer?.toMillis?.() || 0;
+          const tb = b.createdAtServer?.toMillis?.() || 0;
+          return tb - ta;
+        });
+
+      renderAccounts();
+      renderStats();
+
+      // Nếu đang ở dashboard, chỉ render lại (không load orders)
       if (currentPage === 'dashboard') renderDashboard();
     }, (err) => {
-      console.warn('Fallback load:', err);
+      console.warn('onSnapshot error, fallback:', err);
       getDocs(collection(db,'accounts')).then(snap => {
-        accounts = snap.docs.map(d => ({ id:d.id, ...d.data() }));
-        renderAccounts(); renderStats();
+        accounts = snap.docs.map(d => ({ id:d.id, ...d.data() }))
+          .map(a => ({
+            ...a,
+            _passwordPlain: decrypt(a.password || ''),
+            _cookiesPlain: decrypt(a.cookies || '')
+          }))
+          .sort((a,b) => {
+            const ta = a.createdAtServer?.toMillis?.() || 0;
+            const tb = b.createdAtServer?.toMillis?.() || 0;
+            return tb - ta;
+          });
+        renderAccounts();
+        renderStats();
         if (currentPage === 'dashboard') renderDashboard();
       });
     });
   };
 
-  // Load all orders để dùng cho dashboard
-  const loadAllOrders = async () => {
-    const cache = {};
-    for (const acc of accounts) {
-      try {
-        const snap = await getDocs(collection(db,'accounts',acc.id,'orders'));
-        cache[acc.id] = snap.docs.map(d => ({ id:d.id, ...d.data() }));
-      } catch { cache[acc.id] = []; }
+  // ===== LOAD ORDERS (chỉ khi cần) =====
+  // Lấy orders của TẤT CẢ accounts (dùng cho dashboard/export/backup)
+  const loadAllOrders = async (force = false) => {
+    // Nếu cache còn fresh và không force → dùng luôn
+    if (!force && Object.keys(allOrdersCache).length > 0) {
+      const allFresh = accounts.every(a => isOrdersCacheFresh(a.id));
+      if (allFresh) return allOrdersCache;
     }
-    allOrdersCache = cache;
-    return cache;
+    // Tránh chạy song song
+    if (loadingOrdersPromise) return loadingOrdersPromise;
+
+    loadingOrdersPromise = (async () => {
+      const cache = { ...allOrdersCache };
+      const time = { ...ordersCacheTime };
+      for (const acc of accounts) {
+        // Chỉ load account chưa có cache hoặc cache hết hạn
+        if (!force && isOrdersCacheFresh(acc.id) && cache[acc.id]) continue;
+        try {
+          const snap = await getDocs(collection(db,'accounts',acc.id,'orders'));
+          cache[acc.id] = snap.docs.map(d => ({ id:d.id, ...d.data() }));
+          time[acc.id] = Date.now();
+        } catch {
+          cache[acc.id] = cache[acc.id] || [];
+        }
+      }
+      allOrdersCache = cache;
+      ordersCacheTime = time;
+      loadingOrdersPromise = null;
+      return cache;
+    })();
+    return loadingOrdersPromise;
   };
 
   // ===== STATS =====
   const renderStats = () => {
+    if (currentPage !== 'accounts') return;
     const total = accounts.length;
     const totalOrders = accounts.reduce((s,a)=>s+(a.orderCount||0),0);
     const bought = accounts.filter(a=>a.status==='bought').length;
@@ -492,7 +602,7 @@
                       </div>
                     </td>
                     <td class="px-4 py-3 font-mono text-xs text-slate-600">
-                      <span data-copy="${escapeHtml(a.password||'')}" data-copy-label="mật khẩu"
+                      <span data-copy="${escapeHtml(a._passwordPlain||'')}" data-copy-label="mật khẩu"
                         title="Click để copy"
                         class="cursor-copy hover:text-brand-600 hover:underline">••••••</span>
                     </td>
@@ -601,7 +711,7 @@
     }
   };
 
-  // ===== OPEN DETAIL =====
+  // ===== DETAIL =====
   window.openDetail = (id) => {
     currentAccountId = id;
     currentTab = 'info';
@@ -613,7 +723,6 @@
   window.closeDetail = () => { closeModal('detailModal'); currentAccountId = null; };
   window.switchTab = (tab) => { currentTab = tab; renderDetail(); };
 
-  // ===== RENDER DETAIL =====
   const renderDetail = async () => {
     const acc = accounts.find(a => a.id === currentAccountId);
     if (!acc) return;
@@ -636,7 +745,7 @@
       content.innerHTML = `
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           ${infoFieldCopy('Tài khoản', acc.username, 'tài khoản')}
-          ${infoFieldCopy('Mật khẩu', acc.password, 'mật khẩu', true)}
+          ${infoFieldCopy('Mật khẩu', acc._passwordPlain, 'mật khẩu', true)}
           ${infoFieldCopy('SĐT', acc.phone, 'SĐT')}
           ${infoFieldCopy('Email', acc.email, 'email')}
           ${infoFieldCopy('Thiết bị tạo', acc.deviceCreated, 'thiết bị tạo')}
@@ -653,20 +762,20 @@
               ${acc.orderCount||0} <span class="text-sm font-medium">đơn</span>
             </span>
           </div>
-          ${acc.cookies ? `
+          ${acc._cookiesPlain ? `
           <div class="md:col-span-2">
             <div class="flex items-center justify-between mb-1.5">
               <p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide flex items-center gap-1.5">
                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 2a10 10 0 1010 10 10 10 0 01-10-10zM8.5 8.5h.01M7 12h.01M12 15.5h.01"/></svg>
                 Cookies Shopee
               </p>
-              <button data-copy="${escapeHtml(acc.cookies)}" data-copy-label="cookies"
+              <button data-copy="${escapeHtml(acc._cookiesPlain)}" data-copy-label="cookies"
                 class="text-xs font-medium text-brand-500 hover:text-brand-700 hover:underline flex items-center gap-1">
                 <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
                 Copy
               </button>
             </div>
-            <pre class="text-xs text-slate-600 bg-slate-50 border border-slate-100 rounded-xl p-3 font-mono break-all whitespace-pre-wrap max-h-40 overflow-y-auto">${escapeHtml(acc.cookies)}</pre>
+            <pre class="text-xs text-slate-600 bg-slate-50 border border-slate-100 rounded-xl p-3 font-mono break-all whitespace-pre-wrap max-h-40 overflow-y-auto">${escapeHtml(acc._cookiesPlain)}</pre>
           </div>` : ''}
           ${acc.note ? `<div class="md:col-span-2">
             <p class="text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">Ghi chú</p>
@@ -737,77 +846,87 @@
     </div>`;
   };
 
-  // ===== ORDERS =====
-  const loadOrders = async (accountId) => {
+  // ===== LOAD ORDERS 1 account (dùng cache) =====
+  const loadOrders = async (accountId, force = false) => {
     const list = $('#ordersList');
     if (!list) return;
+    // Dùng cache nếu fresh
+    if (!force && isOrdersCacheFresh(accountId) && allOrdersCache[accountId]) {
+      renderOrdersList(accountId, allOrdersCache[accountId]);
+      return;
+    }
     try {
       const snap = await getDocs(collection(db,'accounts',accountId,'orders'));
       const orders = snap.docs.map(d => ({ id:d.id, ...d.data() }));
       orders.sort((a,b)=>(b.orderDate||'').localeCompare(a.orderDate||''));
       allOrdersCache[accountId] = orders;
-
-      if (orders.length === 0) {
-        list.innerHTML = `
-          <div class="text-center py-12 text-slate-400 bg-slate-50 rounded-2xl border-2 border-dashed border-slate-200">
-            <div class="text-5xl mb-3">📦</div>
-            <p class="font-medium text-slate-600">Chưa có đơn hàng nào</p>
-            <p class="text-xs mt-1">Nhấn "Thêm đơn hàng" để ghi lại đơn đầu tiên</p>
-          </div>`;
-        return;
-      }
-
-      list.innerHTML = orders.map((o, idx) => `
-        <div onclick="openOrderDetail('${accountId}','${o.id}')"
-          class="bg-white border border-slate-200 rounded-2xl p-4 hover:border-brand-300 hover:shadow-md hover:shadow-brand-500/5 transition cursor-pointer group">
-          <div class="flex items-start justify-between gap-3 mb-2">
-            <div class="flex items-start gap-3 flex-1 min-w-0">
-              <div class="w-8 h-8 rounded-lg bg-brand-100 text-brand-700 flex items-center justify-center font-bold text-xs flex-shrink-0">
-                ${orders.length - idx}
-              </div>
-              <div class="flex-1 min-w-0">
-                <p class="font-semibold text-slate-800 truncate group-hover:text-brand-600 transition">${escapeHtml(o.productName||'Không tên SP')}</p>
-                ${o.orderCode ? `<p class="text-xs text-slate-400 mt-0.5">Mã đơn: <span class="font-mono">${escapeHtml(o.orderCode)}</span></p>` : ''}
-              </div>
-            </div>
-            <div class="flex items-center gap-1 flex-shrink-0">
-              <button onclick="event.stopPropagation(); openEditOrder('${accountId}','${o.id}')"
-                title="Sửa đơn"
-                class="p-1.5 text-sky-500 hover:text-sky-700 hover:bg-sky-50 rounded-lg transition">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
-              </button>
-              <button onclick="event.stopPropagation(); deleteOrder('${accountId}','${o.id}')"
-                title="Xóa đơn"
-                class="p-1.5 text-rose-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-              </button>
-            </div>
-          </div>
-
-          ${o.voucherUsed ? `
-            <div class="mt-3 flex items-center gap-2 bg-gradient-to-r from-brand-50 to-amber-50 border border-brand-200 rounded-xl p-2.5">
-              <span class="text-lg">🎟️</span>
-              <div class="flex-1 min-w-0">
-                <p class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide">Voucher</p>
-                <p class="font-mono text-sm font-bold text-brand-700 break-all">${escapeHtml(o.voucherUsed)}</p>
-              </div>
-            </div>
-          ` : ''}
-
-          <div class="flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-500 mt-3 pt-3 border-t border-slate-100">
-            ${o.price ? `<span class="font-medium">💰 ${Number(o.price).toLocaleString('vi-VN')}đ</span>` : ''}
-            ${o.orderDate ? `<span>📅 ${formatDate(o.orderDate)}</span>` : ''}
-            ${o.shippingService ? `<span>🚚 ${escapeHtml(o.shippingService)}</span>` : ''}
-            <span>${orderStatusText(o.status)}</span>
-          </div>
-        </div>
-      `).join('');
+      ordersCacheTime[accountId] = Date.now();
+      renderOrdersList(accountId, orders);
     } catch (err) {
       list.innerHTML = `<p class="text-rose-500 text-sm text-center py-4">Lỗi tải đơn: ${err.message}</p>`;
     }
   };
 
-  // ===== ORDER DETAIL MODAL (Mới) =====
+  const renderOrdersList = (accountId, orders) => {
+    const list = $('#ordersList');
+    if (!list) return;
+    if (orders.length === 0) {
+      list.innerHTML = `
+        <div class="text-center py-12 text-slate-400 bg-slate-50 rounded-2xl border-2 border-dashed border-slate-200">
+          <div class="text-5xl mb-3">📦</div>
+          <p class="font-medium text-slate-600">Chưa có đơn hàng nào</p>
+          <p class="text-xs mt-1">Nhấn "Thêm đơn hàng" để ghi lại đơn đầu tiên</p>
+        </div>`;
+      return;
+    }
+    list.innerHTML = orders.map((o, idx) => `
+      <div onclick="openOrderDetail('${accountId}','${o.id}')"
+        class="bg-white border border-slate-200 rounded-2xl p-4 hover:border-brand-300 hover:shadow-md hover:shadow-brand-500/5 transition cursor-pointer group">
+        <div class="flex items-start justify-between gap-3 mb-2">
+          <div class="flex items-start gap-3 flex-1 min-w-0">
+            <div class="w-8 h-8 rounded-lg bg-brand-100 text-brand-700 flex items-center justify-center font-bold text-xs flex-shrink-0">
+              ${orders.length - idx}
+            </div>
+            <div class="flex-1 min-w-0">
+              <p class="font-semibold text-slate-800 truncate group-hover:text-brand-600 transition">${escapeHtml(o.productName||'Không tên SP')}</p>
+              ${o.orderCode ? `<p class="text-xs text-slate-400 mt-0.5">Mã đơn: <span class="font-mono">${escapeHtml(o.orderCode)}</span></p>` : ''}
+            </div>
+          </div>
+          <div class="flex items-center gap-1 flex-shrink-0">
+            <button onclick="event.stopPropagation(); openEditOrder('${accountId}','${o.id}')"
+              title="Sửa đơn"
+              class="p-1.5 text-sky-500 hover:text-sky-700 hover:bg-sky-50 rounded-lg transition">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+            </button>
+            <button onclick="event.stopPropagation(); deleteOrder('${accountId}','${o.id}')"
+              title="Xóa đơn"
+              class="p-1.5 text-rose-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+            </button>
+          </div>
+        </div>
+
+        ${o.voucherUsed ? `
+          <div class="mt-3 flex items-center gap-2 bg-gradient-to-r from-brand-50 to-amber-50 border border-brand-200 rounded-xl p-2.5">
+            <span class="text-lg">🎟️</span>
+            <div class="flex-1 min-w-0">
+              <p class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide">Voucher</p>
+              <p class="font-mono text-sm font-bold text-brand-700 break-all">${escapeHtml(o.voucherUsed)}</p>
+            </div>
+          </div>
+        ` : ''}
+
+        <div class="flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-500 mt-3 pt-3 border-t border-slate-100">
+          ${o.price ? `<span class="font-medium">💰 ${Number(o.price).toLocaleString('vi-VN')}đ</span>` : ''}
+          ${o.orderDate ? `<span>📅 ${formatDate(o.orderDate)}</span>` : ''}
+          ${o.shippingService ? `<span>🚚 ${escapeHtml(o.shippingService)}</span>` : ''}
+          <span>${orderStatusText(o.status)}</span>
+        </div>
+      </div>
+    `).join('');
+  };
+
+  // ===== ORDER DETAIL =====
   window.openOrderDetail = async (accountId, orderId) => {
     try {
       const snap = await getDoc(doc(db,'accounts',accountId,'orders',orderId));
@@ -831,7 +950,6 @@
 
     content.innerHTML = `
       <div class="space-y-4">
-        <!-- Header -->
         <div class="bg-gradient-to-br from-brand-500 to-brand-600 rounded-2xl p-5 text-white">
           <div class="flex items-start justify-between gap-3 mb-3">
             <div class="flex-1 min-w-0">
@@ -851,7 +969,6 @@
           </div>
         </div>
 
-        <!-- Thông tin chung -->
         <div class="grid grid-cols-2 gap-3">
           <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
             <p class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide mb-1">Mã đơn hàng</p>
@@ -866,7 +983,6 @@
           </div>
         </div>
 
-        <!-- Voucher -->
         ${o.voucherUsed ? `
           <div class="bg-gradient-to-r from-brand-50 to-amber-50 border border-brand-200 rounded-xl p-4">
             <div class="flex items-center gap-2 mb-2">
@@ -884,7 +1000,6 @@
           </div>
         ` : ''}
 
-        <!-- Vận chuyển -->
         ${o.shippingService || o.trackingCode ? `
           <div class="bg-sky-50 border border-sky-100 rounded-xl p-4">
             <div class="flex items-center gap-2 mb-3">
@@ -908,7 +1023,6 @@
           </div>
         ` : ''}
 
-        <!-- Địa chỉ nhận hàng -->
         ${o.receiverName || o.receiverPhone || o.receiverAddress ? `
           <div class="bg-emerald-50 border border-emerald-100 rounded-xl p-4">
             <div class="flex items-center justify-between gap-2 mb-3">
@@ -941,14 +1055,26 @@
             </div>
           </div>
         ` : ''}
+
+        <div class="flex justify-end gap-2 pt-2 border-t border-slate-100">
+          <button onclick="openEditOrder('${o.accountId}','${o.id}')"
+            class="px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm font-semibold rounded-xl shadow-sm hover:shadow-md transition flex items-center gap-1.5">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+            Sửa đơn hàng
+          </button>
+        </div>
       </div>
     `;
   };
 
   // ===== ORDER MODAL =====
   window.openAddOrder = () => {
-    if (!currentAccountId) { window.showToast('Chưa chọn tài khoản', 'warn'); return; }
+    // FIX: fallback currentOrder.accountId
+    const accId = currentAccountId || currentOrder?.accountId;
+    if (!accId) { window.showToast('Chưa chọn tài khoản', 'warn'); return; }
+    currentAccountId = accId;
     editingOrderId = null;
+    editingAccountId = null;
     $('#orderModalTitle').textContent = 'Thêm đơn hàng';
     $('#orderForm').reset();
     $('#orderDateInput').value = todayInput();
@@ -957,7 +1083,8 @@
 
   window.openEditOrder = async (accountId, orderId) => {
     editingOrderId = orderId;
-    // Đóng order detail nếu đang mở
+    editingAccountId = accountId; // FIX: lưu riêng
+    if (!currentAccountId) currentAccountId = accountId;
     if (!$('#orderDetailModal').classList.contains('hidden')) closeModal('orderDetailModal');
     $('#orderModalTitle').textContent = 'Sửa đơn hàng';
     try {
@@ -984,6 +1111,7 @@
     closeModal('orderModal');
     $('#orderForm').reset();
     editingOrderId = null;
+    editingAccountId = null;
   };
 
   window.handleAddOrder = async (e) => {
@@ -1008,17 +1136,23 @@
         receiverPhone: form.receiverPhone.value.trim(),
         receiverAddress: form.receiverAddress.value.trim()
       };
-      if (editingOrderId) {
-        await updateDoc(doc(db,'accounts',currentAccountId,'orders',editingOrderId), orderData);
+      if (editingOrderId && editingAccountId) {
+        // FIX: dùng editingAccountId thay vì currentAccountId
+        await updateDoc(doc(db,'accounts',editingAccountId,'orders',editingOrderId), orderData);
         window.showToast('Đã cập nhật đơn hàng', 'success');
+        invalidateOrders(editingAccountId);
       } else {
         orderData.createdAt = serverTimestamp();
         await addDoc(collection(db,'accounts',currentAccountId,'orders'), orderData);
         await updateDoc(doc(db,'accounts',currentAccountId), { orderCount: increment(1) });
         window.showToast('Đã thêm đơn hàng', 'success');
+        invalidateOrders(currentAccountId);
       }
       closeOrderModal();
-      loadOrders(currentAccountId);
+      // Reload orders list nếu đang mở detail
+      if (currentAccountId && currentTab === 'orders') {
+        await loadOrders(currentAccountId, true);
+      }
     } catch (err) {
       window.showToast(err.message, 'error');
     } finally {
@@ -1030,22 +1164,40 @@
     if (!confirm('Xóa đơn hàng này?')) return;
     try {
       await deleteDoc(doc(db,'accounts',accountId,'orders',orderId));
-      const remaining = await getDocs(collection(db,'accounts',accountId,'orders'));
-      await updateDoc(doc(db,'accounts',accountId), { orderCount: remaining.size });
+      // FIX: dùng increment(-1) thay vì đọc lại toàn bộ
+      await updateDoc(doc(db,'accounts',accountId), { orderCount: increment(-1) });
+      invalidateOrders(accountId);
       window.showToast('Đã xóa đơn hàng', 'success');
       if (!$('#orderDetailModal').classList.contains('hidden')) closeModal('orderDetailModal');
-      loadOrders(accountId);
+      if (currentAccountId === accountId && currentTab === 'orders') {
+        await loadOrders(accountId, true);
+      }
     } catch (err) { window.showToast(err.message, 'error'); }
+  };
+
+  // ===== DELETE ACCOUNT (chia batch 400) =====
+  const deleteCollectionInBatches = async (accountId) => {
+    const BATCH_SIZE = 400;
+    let totalDeleted = 0;
+    while (true) {
+      const snap = await getDocs(collection(db,'accounts',accountId,'orders'));
+      if (snap.empty) break;
+      const docs = snap.docs.slice(0, BATCH_SIZE);
+      const batch = writeBatch(db);
+      docs.forEach(d => batch.delete(d.ref));
+      await batch.commit();
+      totalDeleted += docs.length;
+      if (snap.size <= BATCH_SIZE) break;
+    }
+    return totalDeleted;
   };
 
   window.deleteAccount = async (id) => {
     if (!confirm('Xóa tài khoản này?\nToàn bộ đơn hàng của tài khoản cũng sẽ bị xóa.')) return;
     try {
-      const ordersSnap = await getDocs(collection(db,'accounts',id,'orders'));
-      const batch = writeBatch(db);
-      ordersSnap.docs.forEach(d => batch.delete(d.ref));
-      batch.delete(doc(db,'accounts',id));
-      await batch.commit();
+      await deleteCollectionInBatches(id);
+      await deleteDoc(doc(db,'accounts',id));
+      invalidateOrders(id);
       window.showToast('Đã xóa tài khoản', 'success');
       closeDetail();
     } catch (err) { window.showToast(err.message, 'error'); }
@@ -1061,32 +1213,28 @@
     </div>`;
 
     try {
-      // Load all orders nếu chưa có
-      if (Object.keys(allOrdersCache).length === 0) {
-        await loadAllOrders();
-      }
+      // Chỉ load orders khi cache stale hoặc chưa có
+      const needLoad = Object.keys(allOrdersCache).length === 0
+        || accounts.some(a => !isOrdersCacheFresh(a.id));
+      if (needLoad) await loadAllOrders();
 
       const allOrders = Object.values(allOrdersCache).flat();
       const totalOrders = allOrders.length;
       const totalRevenue = allOrders.reduce((s,o)=>s+(Number(o.price)||0),0);
       const avgPrice = totalOrders > 0 ? totalRevenue / totalOrders : 0;
 
-      // Đếm đơn theo trạng thái
       const ordersByStatus = { pending:0, shipping:0, done:0, cancel:0 };
       allOrders.forEach(o => { ordersByStatus[o.status] = (ordersByStatus[o.status]||0) + 1; });
 
-      // Đếm dịch vụ vận chuyển
       const shippingCount = {};
       allOrders.forEach(o => {
         if (o.shippingService) shippingCount[o.shippingService] = (shippingCount[o.shippingService]||0) + 1;
       });
 
-      // Top account có nhiều đơn
       const topAccounts = [...accounts]
         .sort((a,b)=>(b.orderCount||0)-(a.orderCount||0))
         .slice(0, 5);
 
-      // Đơn hàng theo 7 ngày gần đây
       const last7 = [];
       const today = new Date();
       for (let i = 6; i >= 0; i--) {
@@ -1097,12 +1245,10 @@
         last7.push({ label: `${d.getDate()}/${d.getMonth()+1}`, count });
       }
 
-      // Đếm account theo trạng thái
       const accStatus = { bought:0, notbought:0, error:0 };
       accounts.forEach(a => { accStatus[a.status||'notbought']++; });
 
       dash.innerHTML = `
-        <!-- Summary cards -->
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 lg:gap-4 mb-5">
           <div class="bg-gradient-to-br from-brand-500 to-brand-600 rounded-2xl p-4 text-white shadow-lg shadow-brand-500/20">
             <div class="flex items-center justify-between mb-2">
@@ -1144,7 +1290,6 @@
           </div>
         </div>
 
-        <!-- Charts row 1 -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-5">
           <div class="bg-white rounded-2xl border border-slate-200 p-5">
             <div class="flex items-center justify-between mb-4">
@@ -1166,7 +1311,6 @@
           </div>
         </div>
 
-        <!-- Charts row 2 -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-5">
           <div class="bg-white rounded-2xl border border-slate-200 p-5">
             <h3 class="font-bold text-slate-800 mb-1">Trạng thái đơn hàng</h3>
@@ -1176,11 +1320,10 @@
           <div class="bg-white rounded-2xl border border-slate-200 p-5">
             <h3 class="font-bold text-slate-800 mb-1">Dịch vụ vận chuyển</h3>
             <p class="text-xs text-slate-400 mb-4">Top dịch vụ dùng nhiều nhất</p>
-            <div class="h-56"><canvas id="chartShipping"></canvas></div>
+            <div class="h-56" id="shippingChartWrap"><canvas id="chartShipping"></canvas></div>
           </div>
         </div>
 
-        <!-- Top accounts -->
         <div class="bg-white rounded-2xl border border-slate-200 p-5 mb-5">
           <div class="flex items-center justify-between mb-4">
             <div>
@@ -1216,7 +1359,6 @@
         </div>
       `;
 
-      // Vẽ charts
       setTimeout(() => {
         drawChart7Days(last7);
         drawChartAccStatus(accStatus);
@@ -1321,12 +1463,14 @@
 
   const drawChartShipping = (data) => {
     destroyChart('shipping');
+    const wrap = document.getElementById('shippingChartWrap');
+    if (!wrap) return;
+    wrap.innerHTML = '<canvas id="chartShipping"></canvas>';
     const ctx = document.getElementById('chartShipping');
     if (!ctx) return;
-    // Sort & top 6
     const entries = Object.entries(data).sort((a,b)=>b[1]-a[1]).slice(0, 6);
     if (entries.length === 0) {
-      ctx.parentElement.innerHTML = '<p class="text-sm text-slate-400 text-center py-8">Chưa có dữ liệu</p>';
+      wrap.innerHTML = '<p class="text-sm text-slate-400 text-center py-8">Chưa có dữ liệu</p>';
       return;
     }
     charts['shipping'] = new Chart(ctx, {
@@ -1353,20 +1497,383 @@
     });
   };
 
-  // ===== REFRESH DASHBOARD =====
   window.refreshDashboard = async () => {
-    allOrdersCache = {};
-    await loadAllOrders();
+    invalidateOrders();
+    await loadAllOrders(true);
     renderDashboard();
     window.showToast('Đã làm mới dữ liệu', 'success');
   };
 
+  // ===================================================================
+  // ===== EXPORT / IMPORT / BACKUP / RESTORE =====
+  // ===================================================================
+
+  const csvEscape = (v) => {
+    const s = String(v);
+    if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  };
+
+  window.exportAccountsCSV = () => {
+    if (accounts.length === 0) { window.showToast('Không có dữ liệu để export', 'warn'); return; }
+    const headers = [
+      'username','password','phone','email','cookies','deviceCreated','deviceBought',
+      'accountCreatedAt','accountBoughtAt','status','errorCode','note','orderCount'
+    ];
+    const rows = accounts.map(a => headers.map(h => {
+      let v = a[h];
+      if (h === 'password') v = a._passwordPlain || '';
+      if (h === 'cookies') v = a._cookiesPlain || '';
+      return csvEscape(v ?? '');
+    }));
+    const csv = '\uFEFF' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    downloadBlob(csv, `accounts_${todayInput()}.csv`, 'text/csv;charset=utf-8');
+    window.showToast(`Đã export ${accounts.length} tài khoản`, 'success');
+  };
+
+  window.exportOrdersCSV = async () => {
+    if (accounts.length === 0) { window.showToast('Không có dữ liệu để export', 'warn'); return; }
+    window.showToast('Đang tổng hợp đơn hàng...', 'info');
+    await loadAllOrders();
+    const headers = [
+      'accountUsername','productName','voucherUsed','shippingService','trackingCode',
+      'price','orderCode','orderDate','status','receiverName','receiverPhone','receiverAddress'
+    ];
+    const rows = [];
+    for (const acc of accounts) {
+      const orders = allOrdersCache[acc.id] || [];
+      orders.forEach(o => {
+        rows.push(headers.map(h => {
+          if (h === 'accountUsername') return csvEscape(acc.username || '');
+          return csvEscape(o[h] ?? '');
+        }));
+      });
+    }
+    if (rows.length === 0) { window.showToast('Không có đơn hàng nào', 'warn'); return; }
+    const csv = '\uFEFF' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    downloadBlob(csv, `orders_${todayInput()}.csv`, 'text/csv;charset=utf-8');
+    window.showToast(`Đã export ${rows.length} đơn hàng`, 'success');
+  };
+
+  window.exportExcel = async () => {
+    try {
+      if (accounts.length === 0) { window.showToast('Không có dữ liệu', 'warn'); return; }
+      window.showToast('Đang tạo file Excel...', 'info');
+
+      const wb = XLSX.utils.book_new();
+
+      const accData = accounts.map(a => ({
+        'Tài khoản': a.username || '',
+        'Mật khẩu': a._passwordPlain || '',
+        'SĐT': a.phone || '',
+        'Email': a.email || '',
+        'Cookies': a._cookiesPlain || '',
+        'Thiết bị tạo': a.deviceCreated || '',
+        'Thiết bị mua': a.deviceBought || '',
+        'Ngày tạo acc': a.accountCreatedAt || '',
+        'Ngày mua acc': a.accountBoughtAt || '',
+        'Trạng thái': a.status || '',
+        'Mã lỗi': a.errorCode || '',
+        'Ghi chú': a.note || '',
+        'Số đơn': a.orderCount || 0
+      }));
+      const ws1 = XLSX.utils.json_to_sheet(accData);
+      XLSX.utils.book_append_sheet(wb, ws1, 'Accounts');
+
+      await loadAllOrders();
+      const orderData = [];
+      for (const acc of accounts) {
+        const orders = allOrdersCache[acc.id] || [];
+        orders.forEach(o => {
+          orderData.push({
+            'Tài khoản': acc.username || '',
+            'Sản phẩm': o.productName || '',
+            'Voucher': o.voucherUsed || '',
+            'Dịch vụ GH': o.shippingService || '',
+            'Mã vận đơn': o.trackingCode || '',
+            'Giá': o.price || 0,
+            'Mã đơn': o.orderCode || '',
+            'Ngày đặt': o.orderDate || '',
+            'Trạng thái': o.status || '',
+            'Người nhận': o.receiverName || '',
+            'SĐT nhận': o.receiverPhone || '',
+            'Địa chỉ': o.receiverAddress || ''
+          });
+        });
+      }
+      const ws2 = XLSX.utils.json_to_sheet(orderData);
+      XLSX.utils.book_append_sheet(wb, ws2, 'Orders');
+
+      XLSX.writeFile(wb, `shopee_data_${todayInput()}.xlsx`);
+      window.showToast('Đã export Excel', 'success');
+    } catch (err) {
+      window.showToast('Lỗi export: ' + err.message, 'error');
+    }
+  };
+
+  window.importFromExcel = () => {
+    $('#excelFileInput').click();
+  };
+
+  window.handleExcelFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const sheetName = wb.SheetNames.includes('Accounts') ? 'Accounts' : wb.SheetNames[0];
+      const ws = wb.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+      if (rows.length === 0) { window.showToast('File rỗng', 'warn'); return; }
+
+      if (!confirm(`Tìm thấy ${rows.length} dòng. Tiến hành import?`)) return;
+
+      window.showToast(`Đang import ${rows.length} tài khoản...`, 'info');
+      let success = 0, failed = 0;
+
+      for (const row of rows) {
+        try {
+          const username = String(row['Tài khoản'] || row['username'] || '').trim();
+          if (!username) { failed++; continue; }
+          const status = normalizeStatus(row['Trạng thái'] || row['status'] || 'notbought');
+          const data = {
+            username,
+            password: encrypt(String(row['Mật khẩu'] || row['password'] || '').trim()),
+            phone: String(row['SĐT'] || row['phone'] || '').trim(),
+            email: String(row['Email'] || row['email'] || '').trim(),
+            cookies: encrypt(String(row['Cookies'] || row['cookies'] || '').trim()),
+            deviceCreated: String(row['Thiết bị tạo'] || row['deviceCreated'] || '').trim(),
+            deviceBought: String(row['Thiết bị mua'] || row['deviceBought'] || '').trim(),
+            accountCreatedAt: String(row['Ngày tạo acc'] || row['accountCreatedAt'] || todayInput()).trim(),
+            accountBoughtAt: String(row['Ngày mua acc'] || row['accountBoughtAt'] || '').trim(),
+            status,
+            errorCode: status === 'error' ? String(row['Mã lỗi'] || row['errorCode'] || '').trim() : '',
+            note: String(row['Ghi chú'] || row['note'] || '').trim(),
+            orderCount: Number(row['Số đơn'] || row['orderCount'] || 0) || 0,
+            createdAtServer: serverTimestamp()
+          };
+          await addDoc(collection(db,'accounts'), data);
+          success++;
+        } catch (err) {
+          failed++;
+          console.warn('Import row error:', err);
+        }
+      }
+
+      window.showToast(`Import xong: ${success} thành công${failed ? `, ${failed} lỗi` : ''}`, success > 0 ? 'success' : 'warn');
+    } catch (err) {
+      window.showToast('Lỗi đọc file: ' + err.message, 'error');
+    }
+  };
+
+  const normalizeStatus = (s) => {
+    const t = String(s).toLowerCase().trim();
+    if (['bought','đã mua','da mua','đã_mua'].includes(t)) return 'bought';
+    if (['error','lỗi','loi'].includes(t)) return 'error';
+    return 'notbought';
+  };
+
+  window.backupJSON = async () => {
+    try {
+      window.showToast('Đang tạo backup...', 'info');
+      await loadAllOrders();
+      const backup = {
+        version: 3,
+        exportedAt: new Date().toISOString(),
+        accounts: accounts.map(a => {
+          // Loại bỏ field internal + Timestamp không cần thiết
+          const { _passwordPlain, _cookiesPlain, createdAtServer, ...rest } = a;
+          return rest;
+        }),
+        orders: {}
+      };
+      for (const acc of accounts) {
+        backup.orders[acc.id] = (allOrdersCache[acc.id] || []).map(o => {
+          const { createdAt, ...oRest } = o;
+          return oRest;
+        });
+      }
+      const json = JSON.stringify(backup, null, 2);
+      downloadBlob(json, `shopee_backup_${todayInput()}.json`, 'application/json');
+      window.showToast('Đã tạo file backup', 'success');
+    } catch (err) {
+      window.showToast('Lỗi backup: ' + err.message, 'error');
+    }
+  };
+
+  window.restoreJSON = () => {
+    $('#jsonFileInput').click();
+  };
+
+  window.handleJSONFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+    try {
+      const text = await file.text();
+      const backup = JSON.parse(text);
+      if (!backup || !Array.isArray(backup.accounts)) {
+        window.showToast('File backup không hợp lệ', 'error');
+        return;
+      }
+
+      const mode = confirm(
+        `Tìm thấy ${backup.accounts.length} tài khoản và ${Object.values(backup.orders || {}).flat().length} đơn hàng.\n\n` +
+        `Nhấn OK để THÊM VÀO dữ liệu hiện tại.\n` +
+        `Nhấn Cancel để HỦY.`
+      );
+      if (!mode) return;
+
+      window.showToast('Đang khôi phục...', 'info');
+      let accCount = 0, orderCount = 0;
+
+      for (const accData of backup.accounts) {
+        try {
+          const { id: oldId, ...rest } = accData;
+          if (!rest.username) continue;
+          if (rest.password && !String(rest.password).startsWith('enc:')) {
+            rest.password = encrypt(rest.password);
+          }
+          if (rest.cookies && !String(rest.cookies).startsWith('enc:')) {
+            rest.cookies = encrypt(rest.cookies);
+          }
+          rest.createdAtServer = serverTimestamp();
+          const newDoc = await addDoc(collection(db,'accounts'), rest);
+          accCount++;
+
+          const orders = (backup.orders && backup.orders[oldId]) || [];
+          for (const o of orders) {
+            const { id: _oid, createdAt, ...oRest } = o;
+            oRest.createdAt = serverTimestamp();
+            await addDoc(collection(db,'accounts',newDoc.id,'orders'), oRest);
+            orderCount++;
+          }
+        } catch (err) {
+          console.warn('Restore row error:', err);
+        }
+      }
+
+      invalidateOrders();
+      window.showToast(`Đã khôi phục ${accCount} tài khoản, ${orderCount} đơn hàng`, 'success');
+    } catch (err) {
+      window.showToast('Lỗi đọc file: ' + err.message, 'error');
+    }
+  };
+
+  const downloadBlob = (content, filename, mime) => {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // ===== AUTH =====
+  const showLoginScreen = () => {
+    const el = $('#loginScreen');
+    el.classList.remove('hidden');
+    el.classList.add('flex'); // FIX: cần flex để căn giữa
+    $('#appRoot').classList.add('hidden');
+  };
+  const showAppScreen = () => {
+    $('#loginScreen').classList.add('hidden');
+    $('#loginScreen').classList.remove('flex');
+    $('#appRoot').classList.remove('hidden');
+    updateViewButton();
+    loadAccounts(); // loadAccounts tự hủy listener cũ
+  };
+
+  window.handleLogin = async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button[type=submit]');
+    const orig = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="inline-block w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin"></span> Đang đăng nhập...';
+    try {
+      const email = e.target.email.value.trim();
+      const pwd = e.target.password.value;
+      await signInWithEmailAndPassword(auth, email, pwd);
+      window.showToast('Đăng nhập thành công', 'success');
+    } catch (err) {
+      window.showToast('Lỗi đăng nhập: ' + err.message, 'error');
+    } finally {
+      btn.disabled = false; btn.innerHTML = orig;
+    }
+  };
+
+  window.handleLogout = async () => {
+    if (!confirm('Đăng xuất?')) return;
+    try {
+      await signOut(auth);
+      window.showToast('Đã đăng xuất', 'success');
+    } catch (err) { window.showToast(err.message, 'error'); }
+  };
+
+  // ===== ONLINE/OFFLINE INDICATOR =====
+  const updateOnlineStatus = () => {
+    isOnline = navigator.onLine;
+    const el = $('#onlineIndicator');
+    if (!el) return;
+    if (isOnline) {
+      el.className = 'hidden sm:inline-flex items-center gap-1.5 text-xs font-medium text-slate-400 px-3 py-1.5 rounded-lg bg-slate-50 border border-slate-100';
+      el.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>Đã kết nối';
+    } else {
+      el.className = 'hidden sm:inline-flex items-center gap-1.5 text-xs font-medium text-amber-600 px-3 py-1.5 rounded-lg bg-amber-50 border border-amber-200';
+      el.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>Offline';
+    }
+  };
+
+  // ===== PWA =====
+  const registerSW = async () => {
+    if (!('serviceWorker' in navigator)) return;
+    try {
+      const reg = await navigator.serviceWorker.register('sw.js', { scope: './' });
+      console.log('[PWA] SW registered:', reg.scope);
+    } catch (err) {
+      console.warn('[PWA] SW register failed:', err);
+    }
+  };
+
   // ===== INIT =====
   document.addEventListener('DOMContentLoaded', () => {
-    updateViewButton();
-    loadAccounts();
     // Đóng dropdown khi click ngoài
-    document.addEventListener('click', () => closeAppMenu());
+    document.addEventListener('click', (e) => {
+      const menu = $('#appMenu');
+      if (!menu || menu.classList.contains('hidden')) return;
+      if (!e.target.closest('#appMenu') && !e.target.closest('#appMenuBtn')) closeAppMenu();
+    });
+
+    // File inputs
+    $('#excelFileInput').addEventListener('change', handleExcelFile);
+    $('#jsonFileInput').addEventListener('change', handleJSONFile);
+
+    // Online/offline
+    window.addEventListener('online', updateOnlineStatus);
+    window.addEventListener('offline', updateOnlineStatus);
+    updateOnlineStatus();
+
+    // Hiển thị version
+    const verEls = document.querySelectorAll('[data-app-version]');
+    verEls.forEach(el => el.textContent = `Phiên bản ${APP_VERSION}`);
+
+    // PWA
+    registerSW();
+
+    // Auth / Load data
+    if (REQUIRE_AUTH) {
+      onAuthStateChanged(auth, (user) => {
+        if (user) showAppScreen();
+        else showLoginScreen();
+      });
+    } else {
+      showAppScreen();
+    }
   });
 </script>
 
@@ -1383,23 +1890,56 @@
   @keyframes scaleIn { from { transform: scale(.96); opacity: 0 } to { transform: scale(1); opacity: 1 } }
   input, select, textarea, button { font-family: inherit; }
   input:focus, select:focus, textarea:focus { outline: none; }
+  /* PWA splash */
+  @media (display-mode: standalone) {
+    body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+  }
 </style>
 </head>
 
 <body class="bg-slate-50 min-h-screen text-slate-800">
 
+<!-- ===== LOGIN SCREEN ===== -->
+<div id="loginScreen" class="hidden fixed inset-0 bg-gradient-to-br from-brand-500 to-brand-700 items-center justify-center p-4 z-[100]">
+  <div class="bg-white rounded-3xl shadow-2xl w-full max-w-md p-8">
+    <div class="text-center mb-6">
+      <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-brand-400 to-brand-600 text-white flex items-center justify-center mx-auto mb-3 shadow-lg shadow-brand-500/30">
+        <svg class="w-8 h-8" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
+      </div>
+      <h1 class="text-2xl font-extrabold text-slate-800">Accounts Shopee</h1>
+      <p class="text-sm text-slate-400 mt-1">Đăng nhập để tiếp tục</p>
+    </div>
+    <form onsubmit="handleLogin(event)" class="space-y-4">
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Email</label>
+        <input name="email" type="email" required placeholder="admin@example.com"
+          class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-400 focus:bg-white outline-none transition text-sm"/>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Mật khẩu</label>
+        <input name="password" type="password" required placeholder="••••••••"
+          class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-brand-400 focus:bg-white outline-none transition text-sm"/>
+      </div>
+      <button type="submit"
+        class="w-full py-3 bg-gradient-to-br from-brand-500 to-brand-600 hover:from-brand-600 hover:to-brand-700 text-white font-semibold rounded-xl shadow-md shadow-brand-500/20 hover:shadow-lg transition">
+        Đăng nhập
+      </button>
+    </form>
+  </div>
+</div>
+
+<!-- ===== APP ROOT ===== -->
+<div id="appRoot" class="hidden">
 <!-- HEADER -->
 <header class="bg-white/80 backdrop-blur-md border-b border-slate-200 sticky top-0 z-40">
   <div class="max-w-[1500px] mx-auto px-4 lg:px-6 py-3 flex items-center justify-between gap-4">
     <div class="flex items-center gap-3">
-      <!-- Logo + Menu button -->
       <div class="relative">
         <button id="appMenuBtn" onclick="toggleAppMenu(event)"
           class="w-11 h-11 rounded-2xl bg-gradient-to-br from-brand-400 to-brand-600 text-white flex items-center justify-center shadow-md shadow-brand-500/20 hover:shadow-lg hover:shadow-brand-500/30 transition-all hover:scale-105 active:scale-95 cursor-pointer">
           <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
         </button>
-        <!-- App Menu Dropdown -->
-        <div id="appMenu" class="hidden absolute left-0 top-full mt-2 w-64 bg-white rounded-2xl shadow-2xl border border-slate-200 py-2 z-50">
+        <div id="appMenu" class="hidden absolute left-0 top-full mt-2 w-72 bg-white rounded-2xl shadow-2xl border border-slate-200 py-2 z-50">
           <div class="px-3 py-2 border-b border-slate-100 mb-1">
             <p class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Menu</p>
           </div>
@@ -1422,6 +1962,7 @@
             </div>
           </button>
           <div class="border-t border-slate-100 my-1"></div>
+          <p class="px-3 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider">Dữ liệu</p>
           <button onclick="openAddModal()" class="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-slate-50 transition text-left">
             <div class="w-8 h-8 rounded-lg bg-emerald-50 flex items-center justify-center text-emerald-600">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4"/></svg>
@@ -1431,12 +1972,66 @@
               <p class="text-[11px] text-slate-400">Tạo tài khoản mới</p>
             </div>
           </button>
+          <button onclick="exportExcel()" class="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-slate-50 transition text-left">
+            <div class="w-8 h-8 rounded-lg bg-sky-50 flex items-center justify-center text-sky-600">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            </div>
+            <div class="flex-1">
+              <p class="text-sm font-semibold text-slate-800">Export Excel</p>
+              <p class="text-[11px] text-slate-400">Accounts + Orders</p>
+            </div>
+          </button>
+          <button onclick="exportAccountsCSV()" class="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-slate-50 transition text-left">
+            <div class="w-8 h-8 rounded-lg bg-sky-50 flex items-center justify-center text-sky-600">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            </div>
+            <div class="flex-1">
+              <p class="text-sm font-semibold text-slate-800">Export CSV Accounts</p>
+              <p class="text-[11px] text-slate-400">Chỉ tài khoản</p>
+            </div>
+          </button>
+          <button onclick="exportOrdersCSV()" class="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-slate-50 transition text-left">
+            <div class="w-8 h-8 rounded-lg bg-sky-50 flex items-center justify-center text-sky-600">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            </div>
+            <div class="flex-1">
+              <p class="text-sm font-semibold text-slate-800">Export CSV Orders</p>
+              <p class="text-[11px] text-slate-400">Chỉ đơn hàng</p>
+            </div>
+          </button>
+          <button onclick="importFromExcel()" class="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-slate-50 transition text-left">
+            <div class="w-8 h-8 rounded-lg bg-amber-50 flex items-center justify-center text-amber-600">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10"/></svg>
+            </div>
+            <div class="flex-1">
+              <p class="text-sm font-semibold text-slate-800">Import Excel</p>
+              <p class="text-[11px] text-slate-400">Nhập hàng loạt accounts</p>
+            </div>
+          </button>
+          <button onclick="backupJSON()" class="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-slate-50 transition text-left">
+            <div class="w-8 h-8 rounded-lg bg-violet-50 flex items-center justify-center text-violet-600">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+            </div>
+            <div class="flex-1">
+              <p class="text-sm font-semibold text-slate-800">Backup JSON</p>
+              <p class="text-[11px] text-slate-400">Toàn bộ dữ liệu</p>
+            </div>
+          </button>
+          <button onclick="restoreJSON()" class="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-slate-50 transition text-left">
+            <div class="w-8 h-8 rounded-lg bg-violet-50 flex items-center justify-center text-violet-600">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+            </div>
+            <div class="flex-1">
+              <p class="text-sm font-semibold text-slate-800">Restore JSON</p>
+              <p class="text-[11px] text-slate-400">Khôi phục từ backup</p>
+            </div>
+          </button>
           <div class="border-t border-slate-100 my-1"></div>
           <div class="px-3 py-2 text-[11px] text-slate-400 flex items-center justify-between">
-            <span>Phiên bản 1.0</span>
+            <span data-app-version>Phiên bản 1.0</span>
             <span class="inline-flex items-center gap-1">
               <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-              Online
+              PWA
             </span>
           </div>
         </div>
@@ -1447,7 +2042,6 @@
       </div>
     </div>
 
-    <!-- Nav links (desktop) -->
     <nav class="hidden md:flex items-center gap-1 absolute left-1/2 -translate-x-1/2">
       <button data-nav="accounts" onclick="switchPage('accounts')"
         class="px-3 py-2 rounded-xl text-sm font-semibold text-brand-600 bg-brand-50 flex items-center gap-1.5 transition">
@@ -1462,7 +2056,7 @@
     </nav>
 
     <div class="flex items-center gap-2">
-      <span class="hidden sm:inline-flex items-center gap-1.5 text-xs font-medium text-slate-400 px-3 py-1.5 rounded-lg bg-slate-50 border border-slate-100">
+      <span id="onlineIndicator" class="hidden sm:inline-flex items-center gap-1.5 text-xs font-medium text-slate-400 px-3 py-1.5 rounded-lg bg-slate-50 border border-slate-100">
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
         Đã kết nối
       </span>
@@ -1478,9 +2072,7 @@
 <!-- MAIN -->
 <main class="max-w-[1500px] mx-auto px-4 lg:px-6 py-6">
 
-  <!-- ===== ACCOUNTS VIEW ===== -->
   <div id="accountsView">
-    <!-- STATS -->
     <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 lg:gap-4 mb-6">
       <div class="bg-white rounded-2xl border border-slate-200 p-4 hover:shadow-md hover:shadow-slate-200/50 transition">
         <div class="flex items-center justify-between mb-2">
@@ -1529,7 +2121,6 @@
       </div>
     </div>
 
-    <!-- TOOLBAR -->
     <div class="bg-white rounded-2xl border border-slate-200 p-3 mb-5 flex flex-col md:flex-row gap-3">
       <div class="flex-1 relative">
         <svg class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
@@ -1561,11 +2152,9 @@
       </div>
     </div>
 
-    <!-- ACCOUNTS -->
     <div id="accountContainer"></div>
   </div>
 
-  <!-- ===== DASHBOARD VIEW ===== -->
   <div id="dashboardView" class="hidden">
     <div class="flex items-center justify-between mb-5">
       <div>
@@ -1582,6 +2171,11 @@
   </div>
 
 </main>
+</div>
+
+<!-- Hidden file inputs -->
+<input id="excelFileInput" type="file" accept=".xlsx,.xls,.csv" class="hidden" />
+<input id="jsonFileInput" type="file" accept=".json" class="hidden" />
 
 <!-- MODAL: ADD/EDIT ACCOUNT -->
 <div id="addModal" class="hidden fixed inset-0 modal-backdrop z-50 items-center justify-center p-4">
@@ -1708,7 +2302,7 @@
   </div>
 </div>
 
-<!-- MODAL: ORDER DETAIL (Mới) -->
+<!-- MODAL: ORDER DETAIL -->
 <div id="orderDetailModal" class="hidden fixed inset-0 modal-backdrop z-[55] items-center justify-center p-4">
   <div class="modal-panel bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[90vh] overflow-y-auto">
     <div class="flex items-center justify-between p-5 border-b border-slate-100 sticky top-0 bg-white rounded-t-2xl z-10">
@@ -1718,12 +2312,9 @@
         </div>
         <h2 class="text-lg font-bold text-slate-800">Chi tiết đơn hàng</h2>
       </div>
-      <div class="flex items-center gap-1">
-        <button onclick="openEditOrder('${'' /* placeholder */}')" id="editOrderBtn" class="hidden"></button>
-        <button onclick="closeOrderDetail()" class="w-8 h-8 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition flex items-center justify-center">
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
-        </button>
-      </div>
+      <button onclick="closeOrderDetail()" class="w-8 h-8 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition flex items-center justify-center">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
     </div>
     <div id="orderDetailContent" class="p-5"></div>
   </div>
